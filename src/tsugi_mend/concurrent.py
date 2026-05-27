@@ -48,9 +48,12 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tsugi_mend.reducer import GraceWindowSyncer, LearnerFragment, MergeResult
+
+if TYPE_CHECKING:
+    from concurrent.futures import Future
 
 _LOG = logging.getLogger(__name__)
 
@@ -75,7 +78,7 @@ FragmentProvider = Callable[[], "asyncio.Queue[LearnerFragment]"]
 class _PendingRound:
     """Mutable state for one outer-round in flight."""
     round_id: int
-    task: asyncio.Future
+    task: Future[MergeResult]
     # Captured at submit_async() time so collect() can re-raise deterministically.
     submitted_at_s: float
 
@@ -259,7 +262,7 @@ class ConcurrentOuterStep:
             if result is not None:
                 return result
 
-    def _on_task_done(self, task: asyncio.Future) -> None:
+    def _on_task_done(self, task: Future[MergeResult]) -> None:
         """asyncio thread callback: transition the state machine on
         completion or exception."""
         try:

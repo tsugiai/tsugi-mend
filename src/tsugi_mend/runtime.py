@@ -33,7 +33,7 @@ import torch.nn as nn
 from tsugi_mend.async_tp import enable_async_tp
 from tsugi_mend.concurrent import ConcurrentOuterStep, FragmentProvider
 from tsugi_mend.config import MendConfig
-from tsugi_mend.desync_optimizer import DesynchronizedSyncSchedule
+from tsugi_mend.desync_optimizer import DesynchronizedSyncSchedule, SyncSchedule
 from tsugi_mend.diagnostics import DiagnosticsWriter
 from tsugi_mend.failslow import FailSlowDetector
 from tsugi_mend.reducer import GraceWindowSyncer, MergeResult
@@ -219,7 +219,7 @@ class _MaxRuntime:
             if len(self._warmup_step_times_ms) >= self.config.auto_tune_sync_period_warmup_steps:
                 self._decide_auto_tune(step)
 
-    def schedule_for(self, step: int):
+    def schedule_for(self, step: int) -> SyncSchedule:
         """Convenience pass-through to the DES-LOC schedule."""
         return self.sched.tick(step)
 
