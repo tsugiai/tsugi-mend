@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tsugi-mend"
-version = "0.1.0"
+version = "0.1.1"
 description = "tsugiai-mend-sdk. Maximum-uplift cross-rack distributed-training reducer built on Decoupled DiLoCo + DES-LOC + async tensor parallelism + FALCON fail-slow mitigation. Patent-independent by deliberate construction; see LICENSE preamble."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,9 @@ dependencies = [
     "torch>=2.4",
     "numpy>=1.26",
 ]
+
+[project.scripts]
+tsugi-mend = "tsugi_mend.__main__:main"
 
 [project.optional-dependencies]
 benchmark = [
@@ -53,6 +56,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tsugi_mend"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/tsugi_mend/py.typed" = "tsugi_mend/py.typed"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
