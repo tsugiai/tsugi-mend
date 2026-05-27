@@ -295,11 +295,11 @@ def test_auto_tuner_on_delay_bound_regime_sets_n_star(tmp_path):
     should equal ceil(G / T_step), bounded above by the static
     sync_period_steps."""
     model = ToyLoraStyleModel()
-    # G=200ms, T_step ~= 10ms via sleep => N* = ceil(200/10) = 20, but
-    # clamped to sync_period_steps=15 (the upper bound).
+    # Keep G well above the static upper bound times T_step so timing
+    # jitter on loaded runners cannot drop raw N* below the clamp.
     config = MendConfig(
         quorum_min_learners=1,
-        grace_window_ms=200,
+        grace_window_ms=10_000,
         sync_period_steps=15,
         momentum_sync_period_steps=60,
         auto_tune_sync_period=True,
@@ -314,11 +314,11 @@ def test_auto_tuner_on_delay_bound_regime_sets_n_star(tmp_path):
         # Drive 25 steps at ~10ms each. The warmup boundary fires at
         # step 19 (0-indexed; warmup_steps=20 samples).
         _drive_step_loop(rt, n_steps=25, step_sleep_s=0.010)
-        # raw N* = ceil(200 / ~10) = 20; clamped to 15 (the static
-        # sync_period_steps upper bound).
+        # Raw N* stays above 15 even on a heavily loaded runner, so the
+        # effective value must be the static sync_period_steps upper bound.
         eff = rt.effective_sync_period_steps()
         assert eff == 15, (
-            f"expected effective_sync_period=15 (clamped from raw N*~20); got {eff}"
+            f"expected effective_sync_period=15 from the static upper-bound clamp; got {eff}"
         )
     finally:
         mend_shutdown(model)
@@ -330,8 +330,8 @@ def test_auto_tuner_on_delay_bound_regime_sets_n_star(tmp_path):
     decided = [e for e in events if e["event"] == "auto_tune_sync_period_decided"]
     assert len(decided) == 1
     assert decided[0]["effective_sync_period_steps"] == 15
-    assert decided[0]["n_star_raw"] >= 15  # the unclamped N* exceeds the upper bound
-    assert decided[0]["grace_window_ms"] == 200
+    assert decided[0]["n_star_raw"] > 15  # the unclamped N* exceeds the upper bound
+    assert decided[0]["grace_window_ms"] == 10_000
 
 
 def test_auto_tuner_on_compute_bound_regime_picks_smaller_n(tmp_path):
