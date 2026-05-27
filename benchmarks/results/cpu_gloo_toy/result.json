@@ -1,0 +1,339 @@
+{
+  "bit_exact_loss": {
+    "checked_steps": 24,
+    "max_abs_loss_delta": 0.0,
+    "mismatches": [],
+    "passed": true
+  },
+  "config": {
+    "backend": "gloo",
+    "batch_size": 8,
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 20260527,
+    "grace_window_ms": 0,
+    "hardware_label": "local_cpu_gloo",
+    "hidden_dim": 64,
+    "input_dim": 16,
+    "learning_rate": 0.01,
+    "model": "toy-mlp",
+    "momentum_sync_period_steps": 8,
+    "output_dim": 16,
+    "ranks": 2,
+    "run_label": "cpu_gloo_toy",
+    "seed": 20260527,
+    "seq_len": 16,
+    "simulated_merge_delay_ms": 0,
+    "steps": 24,
+    "sync_period_steps": 4,
+    "warmup_steps": 4
+  },
+  "created_at_utc": "2026-05-27T21:53:53+00:00",
+  "hardware": {
+    "accelerator": "none",
+    "interconnect": "local gloo over loopback",
+    "label": "local_cpu_gloo",
+    "nodes": 1,
+    "provider": "local",
+    "public_cost_usd": 0.0
+  },
+  "notes": [
+    "Cheap $0 CPU/gloo cell; this is not a real cross-rack production run.",
+    "Synthetic zero-delta outer fragments exercise the control path without changing the optimizer trajectory.",
+    "Do not compare this local toy result to published multi-node headline cells."
+  ],
+  "per_step": [
+    {
+      "baseline_loss": 1.029015302658081,
+      "baseline_step_ms": 18.014792003668845,
+      "baseline_tokens_per_s": 14210.54430980184,
+      "sdk_loss": 1.029015302658081,
+      "sdk_step_ms": 1.5481660375371575,
+      "sdk_tokens_per_s": 165356.94091781531,
+      "steady_state": false,
+      "step": 0,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0123341083526611,
+      "baseline_step_ms": 1.6076249303296208,
+      "baseline_tokens_per_s": 159241.12345502805,
+      "sdk_loss": 1.0123341083526611,
+      "sdk_step_ms": 1.5936249401420355,
+      "sdk_tokens_per_s": 160640.05623379827,
+      "steady_state": false,
+      "step": 1,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.029181957244873,
+      "baseline_step_ms": 1.5864999732002616,
+      "baseline_tokens_per_s": 161361.4902769907,
+      "sdk_loss": 1.029181957244873,
+      "sdk_step_ms": 1.299499999731779,
+      "sdk_tokens_per_s": 196998.8457505496,
+      "steady_state": false,
+      "step": 2,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0439074039459229,
+      "baseline_step_ms": 1.559915952384472,
+      "baseline_tokens_per_s": 164111.40587970844,
+      "sdk_loss": 1.0439074039459229,
+      "sdk_step_ms": 1.278833020478487,
+      "sdk_tokens_per_s": 200182.50694231782,
+      "steady_state": false,
+      "step": 3,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.086301565170288,
+      "baseline_step_ms": 1.5566670335829258,
+      "baseline_tokens_per_s": 164453.92269326458,
+      "sdk_loss": 1.086301565170288,
+      "sdk_step_ms": 1.4012919273227453,
+      "sdk_tokens_per_s": 182688.55690127594,
+      "steady_state": true,
+      "step": 4,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0628101825714111,
+      "baseline_step_ms": 1.656375010497868,
+      "baseline_tokens_per_s": 154554.37227530516,
+      "sdk_loss": 1.0628101825714111,
+      "sdk_step_ms": 1.596916001290083,
+      "sdk_tokens_per_s": 160308.99545949072,
+      "steady_state": true,
+      "step": 5,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.1009641885757446,
+      "baseline_step_ms": 1.4581249561160803,
+      "baseline_tokens_per_s": 175567.94356081236,
+      "sdk_loss": 1.1009641885757446,
+      "sdk_step_ms": 1.2857499532401562,
+      "sdk_tokens_per_s": 199105.5876415681,
+      "steady_state": true,
+      "step": 6,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0166652202606201,
+      "baseline_step_ms": 1.3670000480487943,
+      "baseline_tokens_per_s": 187271.39063777286,
+      "sdk_loss": 1.0166652202606201,
+      "sdk_step_ms": 1.2989169918000698,
+      "sdk_tokens_per_s": 197087.26702021903,
+      "steady_state": true,
+      "step": 7,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0985729694366455,
+      "baseline_step_ms": 1.3584999833256006,
+      "baseline_tokens_per_s": 188443.13812453157,
+      "sdk_loss": 1.0985729694366455,
+      "sdk_step_ms": 1.5154170105233788,
+      "sdk_tokens_per_s": 168930.3988422206,
+      "steady_state": true,
+      "step": 8,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0401580333709717,
+      "baseline_step_ms": 1.2249579885974526,
+      "baseline_tokens_per_s": 208986.75904233567,
+      "sdk_loss": 1.0401580333709717,
+      "sdk_step_ms": 1.7345419619232416,
+      "sdk_tokens_per_s": 147589.3957135231,
+      "steady_state": true,
+      "step": 9,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0742775201797485,
+      "baseline_step_ms": 1.2701249215751886,
+      "baseline_tokens_per_s": 201554.97750765563,
+      "sdk_loss": 1.0742775201797485,
+      "sdk_step_ms": 1.4816669281572104,
+      "sdk_tokens_per_s": 172778.37220703455,
+      "steady_state": true,
+      "step": 10,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 0.966310977935791,
+      "baseline_step_ms": 1.266125007532537,
+      "baseline_tokens_per_s": 202191.7255223484,
+      "sdk_loss": 0.966310977935791,
+      "sdk_step_ms": 1.4591669896617532,
+      "sdk_tokens_per_s": 175442.56539091724,
+      "steady_state": true,
+      "step": 11,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.079707384109497,
+      "baseline_step_ms": 1.3172500766813755,
+      "baseline_tokens_per_s": 194344.2665381775,
+      "sdk_loss": 1.079707384109497,
+      "sdk_step_ms": 1.3843340566381812,
+      "sdk_tokens_per_s": 184926.46249106177,
+      "steady_state": true,
+      "step": 12,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0103412866592407,
+      "baseline_step_ms": 1.2597920140251517,
+      "baseline_tokens_per_s": 203208.1463844626,
+      "sdk_loss": 1.0103412866592407,
+      "sdk_step_ms": 1.6541669610887766,
+      "sdk_tokens_per_s": 154760.6777441016,
+      "steady_state": true,
+      "step": 13,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0081056356430054,
+      "baseline_step_ms": 1.283791963942349,
+      "baseline_tokens_per_s": 199409.25569736326,
+      "sdk_loss": 1.0081056356430054,
+      "sdk_step_ms": 1.3420420000329614,
+      "sdk_tokens_per_s": 190754.0896586787,
+      "steady_state": true,
+      "step": 14,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0099670886993408,
+      "baseline_step_ms": 1.38262496329844,
+      "baseline_tokens_per_s": 185155.05418712908,
+      "sdk_loss": 1.0099670886993408,
+      "sdk_step_ms": 1.2652500299736857,
+      "sdk_tokens_per_s": 202331.55023542992,
+      "steady_state": true,
+      "step": 15,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.044602632522583,
+      "baseline_step_ms": 1.2659999774768949,
+      "baseline_tokens_per_s": 202211.6939608493,
+      "sdk_loss": 1.044602632522583,
+      "sdk_step_ms": 1.348166959360242,
+      "sdk_tokens_per_s": 189887.46031981235,
+      "steady_state": true,
+      "step": 16,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0276538133621216,
+      "baseline_step_ms": 1.2242919765412807,
+      "baseline_tokens_per_s": 209100.44736486778,
+      "sdk_loss": 1.0276538133621216,
+      "sdk_step_ms": 1.6010829713195562,
+      "sdk_tokens_per_s": 159891.7761201431,
+      "steady_state": true,
+      "step": 17,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0486958026885986,
+      "baseline_step_ms": 1.326833968050778,
+      "baseline_tokens_per_s": 192940.49305662853,
+      "sdk_loss": 1.0486958026885986,
+      "sdk_step_ms": 1.3687920290976763,
+      "sdk_tokens_per_s": 187026.22060763912,
+      "steady_state": true,
+      "step": 18,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.083240270614624,
+      "baseline_step_ms": 1.2980829924345016,
+      "baseline_tokens_per_s": 197213.89271103725,
+      "sdk_loss": 1.083240270614624,
+      "sdk_step_ms": 1.2047919444739819,
+      "sdk_tokens_per_s": 212484.82044903684,
+      "steady_state": true,
+      "step": 19,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0228079557418823,
+      "baseline_step_ms": 1.2786670122295618,
+      "baseline_tokens_per_s": 200208.49646666241,
+      "sdk_loss": 1.0228079557418823,
+      "sdk_step_ms": 1.3589999871328473,
+      "sdk_tokens_per_s": 188373.8060513867,
+      "steady_state": true,
+      "step": 20,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0517079830169678,
+      "baseline_step_ms": 1.2476249830797315,
+      "baseline_tokens_per_s": 205189.8635181786,
+      "sdk_loss": 1.0517079830169678,
+      "sdk_step_ms": 1.4784170780330896,
+      "sdk_tokens_per_s": 173158.1728889297,
+      "steady_state": true,
+      "step": 21,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 0.9899372458457947,
+      "baseline_step_ms": 1.2315829517319798,
+      "baseline_tokens_per_s": 207862.5720175699,
+      "sdk_loss": 0.9899372458457947,
+      "sdk_step_ms": 1.308875042013824,
+      "sdk_tokens_per_s": 195587.80768416257,
+      "steady_state": true,
+      "step": 22,
+      "tokens": 256
+    },
+    {
+      "baseline_loss": 1.0330835580825806,
+      "baseline_step_ms": 1.261834055185318,
+      "baseline_tokens_per_s": 202879.2922080414,
+      "sdk_loss": 1.0330835580825806,
+      "sdk_step_ms": 1.297708018682897,
+      "sdk_tokens_per_s": 197270.8778202866,
+      "steady_state": true,
+      "step": 23,
+      "tokens": 256
+    }
+  ],
+  "protocol": "docs/benchmark_protocol.md",
+  "run_label": "cpu_gloo_toy",
+  "schema_version": 1,
+  "software": {
+    "python": "3.12.13",
+    "torch": "2.12.0"
+  },
+  "summary": {
+    "baseline": {
+      "mean_tokens_per_s": 194137.3851737497,
+      "p50_step_ms": 1.2812294880859554,
+      "p95_step_ms": 1.561652432428673,
+      "p99_step_ms": 1.6374304948840288,
+      "steady_state_steps": 20
+    },
+    "bootstrap_95_ci_pct": [
+      -11.387467244489528,
+      -1.0964934489696565
+    ],
+    "sdk": {
+      "mean_tokens_per_s": 182019.24306234592,
+      "p50_step_ms": 1.3765630428679287,
+      "p95_step_ms": 1.6581857111305,
+      "p99_step_ms": 1.7192707117646933,
+      "steady_state_steps": 20
+    },
+    "sdk_final_drain_ms": 0.001500011421740055,
+    "uplift_pct": -6.2420445709404415
+  }
+}
