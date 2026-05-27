@@ -54,26 +54,52 @@ cells below can be re-derived by anyone who runs the protocol on the
 stated hardware. We report point estimates with their 95% CI where
 available and flag single-seed (n=1) cells explicitly.
 
+### Production-grounded results
+
+The most defensible headline is the real 2-node cross-network V100
+measurement: actual off-rack traffic, not an injected delay, with
+bit-exact loss. The adjacent multi-GPU FSDP result is the realistic
+floor to keep beside that headline.
+
 | Workload | Hardware | Measurement |
 |---|---|---|
-| **Statistical-confidence headline (Hopper 3-seed CI)** | Modal H100:1, Qwen-2.5-1.5B, 200 steps × 3 seeds at 2000ms grace window | **+71.49% ± 2.83% (95% CI, n=3)** throughput uplift |
+| **Real cross-network 2-node 8xV100 (synchronous reducer)** | Lambda Labs commodity Ethernet, SmolLM-135M, 500 paired steps | **+28.58% tokens-per-second uplift vs vanilla FSDP, bit-exact-identical loss** |
+| Production-realistic multi-GPU FSDP + 7B model (realistic floor, 3-seed CI) | Modal 8xH100 FSDP FULL_SHARD, Qwen-2.5-7B + simulated 2-rack, 4 delays × 3 seeds | +6.37% ± 1.31% at 2000ms (n=3) |
+| H100 Hopper single-instance (synchronous reducer baseline) | Modal 8x H100 SXM5, Llama-3-8B, 2000 paired steps × 3 seeds | -0.97% ± 1.5% (predicted null; Hopper NVLink absorbs the synchronous-path cross-rack tax) |
+| Real cross-network 2-pod 8xH100 (production-fabric floor; n=1) | RunPod 2x 8x H100 SXM5 over real InfiniBand / RoCE v2 3.2 Tbps, Llama-3-8B, 500 paired steps × 1 seed | +1.42% tps + 0.18% loss delta (effectively bit-exact); **n=1 caveat is load-bearing** (same order of magnitude as baseline-only seed variance); n=3 CI pending |
+
+How to read the production-grounded numbers honestly:
+
+- The **+28.58% real cross-network V100** result is the headline production-grounded number: it is a real 2-node cross-Ethernet measurement with bit-exact loss.
+- Production-realistic multi-GPU FSDP yields a smaller honest floor (**+6.37% ± 1.31%, n=3**) because 8-rank NCCL pipelining absorbs some of the simulated delay.
+- The real-fabric Hopper 2-pod InfiniBand / RoCE result remains a point estimate: **n=1 caveat is load-bearing** and the n=3 CI is pending.
+
+### Ceiling-case / simulated-delay results
+
+Every cell in this subsection uses an injected simulated grace-window
+delay on a single instance or simulated two-rack setup, not a real
+cross-network measurement. These are ceiling-case stress tests for the
+overlap mechanism rather than production numbers.
+
+| Workload | Hardware | Measurement |
+|---|---|---|
+| Statistical-confidence ceiling case (Hopper 3-seed CI) | Modal H100:1, Qwen-2.5-1.5B, 200 steps × 3 seeds at 2000ms grace window | **+71.49% ± 2.83% (95% CI, n=3)** throughput uplift |
 | Cross-rack grace-window overlap on Hopper at 7B scale | Modal H100:1, Qwen-2.5-7B, 200 steps × 5 delays | +76.58% at 2000ms; +39.72% at 1000ms; +19.20% at 500ms |
 | Intermediate model-scale (3B) confirmation (Hopper 3-seed CI) | Modal H100:1, Qwen-2.5-3B, 200 steps × 4 delays × 3 seeds | +41.31% ± 0.29% at 2000ms (n=3); +20.40% ± 0.03% at 1000ms; +9.75% ± 0.04% at 500ms |
 | Cross-rack grace-window overlap at 1.5B scale | Modal H100:1, Qwen-2.5-1.5B, 200 steps × 7 delays | +70.64% at 2000ms; +34.73% at 1000ms; +16.86% at 500ms |
 | Cross-rack grace-window overlap on A10G | Modal A10G, SmolLM-135M, 200 steps × 7 delays | +52.75% at 2000ms (constant); +11.61% at 500ms; -0.06% overhead at 0ms; bit-exact loss preserved across all cells |
-| Production-realistic multi-GPU FSDP + 7B model (3-seed CI) | Modal 8xH100 FSDP FULL_SHARD, Qwen-2.5-7B + simulated 2-rack, 4 delays × 3 seeds | +6.37% ± 1.31% at 2000ms (n=3) |
-| **Real cross-network 2-node 8xV100 (synchronous reducer)** | Lambda Labs commodity Ethernet, SmolLM-135M, 500 paired steps | **+28.58% tokens-per-second uplift vs vanilla FSDP, bit-exact-identical loss** |
-| H100 Hopper single-instance (synchronous reducer baseline) | Modal 8x H100 SXM5, Llama-3-8B, 2000 paired steps × 3 seeds | -0.97% ± 1.5% (predicted null; Hopper NVLink absorbs the synchronous-path cross-rack tax) |
-| Real cross-network 2-pod 8xH100 (production-fabric floor; n=1) | RunPod 2x 8x H100 SXM5 over real InfiniBand / RoCE v2 3.2 Tbps, Llama-3-8B, 500 paired steps × 1 seed | +1.42% tps + 0.18% loss delta (effectively bit-exact); **n=1 caveat is load-bearing** (same order of magnitude as baseline-only seed variance); n=3 CI pending |
 
-How to read these numbers honestly:
+How to read the ceiling-case numbers honestly:
 
-- The **+71.49% ± 2.83% (n=3) Hopper headline** is a single-instance measurement with an injected (simulated) grace-window delay, NOT a real cross-network result; read it as a ceiling-case for the overlap mechanism rather than a production number. The orchestrator's uplift is governed by `N · T_step / G` (sync-period steps × per-step compute time vs grace-window ms). Apparent non-monotonicity with model size (Qwen-3B +41.31% below both Qwen-1.5B and Qwen-7B) is explained by the Qwen-7B measurement using 1/8 the tokens-per-step (seq_len 1024 / mbs 1 vs 2048 / 4); at fixed tokens-per-step, uplift is monotonically decreasing in model size.
-- The **+28.58% real cross-network V100** result is the most defensible production-grounded headline: it is a real 2-node cross-Ethernet measurement (not a simulated delay) with bit-exact loss.
-- Production-realistic multi-GPU FSDP yields a smaller honest floor (**+6.37% ± 1.31%, n=3**) because 8-rank NCCL pipelining absorbs some of the simulated delay.
+- The **+71.49% ± 2.83% (n=3) Hopper result** is a single-instance measurement with an injected simulated grace-window delay, not a real cross-network result. Read it as a ceiling-case for the overlap mechanism.
+- The orchestrator's uplift is governed by `N · T_step / G` (sync-period steps × per-step compute time vs grace-window ms). Apparent non-monotonicity with model size (Qwen-3B +41.31% below both Qwen-1.5B and Qwen-7B) is explained by the Qwen-7B measurement using 1/8 the tokens-per-step (seq_len 1024 / mbs 1 vs 2048 / 4); at fixed tokens-per-step, uplift is monotonically decreasing in model size.
 - Constant-delay headlines (e.g. +52.75% A10G at 2000ms) are ceiling-case stress tests. The FALCON paper documents cross-rack inter-node RDMA variance (CoV=0.29) but does not characterize the per-iteration latency distribution shape; the delay sweep is a stress test, not a literal FALCON replay.
 
 At every scale the concurrent path's throughput is rock-solid across delays (Qwen-7B single-process: 4,300 ± 80 tok/s; Qwen-3B Hopper: 18,153 ± 4 tok/s; Qwen-1.5B Hopper: 30,840 ± 35 tok/s; SmolLM-135M A10G: 23,610 ± 80 tok/s) while the synchronous baseline collapses linearly with delay.
+
+### Run it multi-node
+
+See [`docs/multinode.md`](docs/multinode.md) for the multi-node launch walkthrough.
 
 ## Status
 
