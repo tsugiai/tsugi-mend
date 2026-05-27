@@ -28,10 +28,34 @@ Differences from tsugi_kpool.sideband.Sideband:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import ipaddress
 import json
+import ssl
 import time
-from dataclasses import dataclass, asdict
-from typing import Optional
+import warnings
+from dataclasses import asdict, dataclass
+from typing import ClassVar, Optional, TypeGuard, cast
+
+
+DEFAULT_SIDEBAND_MAX_LINE_BYTES = 4096
+_MAX_HEARTBEAT_INT = 2**63 - 1
+_MAX_HEARTBEAT_TEXT_BYTES = 1024
+_HEARTBEAT_FIELDS = frozenset(
+    {
+        "rank_id",
+        "hostname",
+        "step_id",
+        "vector_clock_us",
+        "queue_depth",
+        "health_bit",
+    }
+)
+_HMAC_PAYLOAD_FIELD = "payload"
+_HMAC_NONCE_FIELD = "nonce_ns"
+_HMAC_FIELD = "hmac_sha256"
+_HMAC_ENVELOPE_FIELDS = frozenset({_HMAC_PAYLOAD_FIELD, _HMAC_NONCE_FIELD, _HMAC_FIELD})
 
 
 @dataclass
@@ -72,6 +96,8 @@ class Sideband:
     (default 100 ms).
     """
 
+    _insecure_bind_warning_emitted: ClassVar[bool] = False
+
     def __init__(
         self,
         rank_id: str,
@@ -80,13 +106,38 @@ class Sideband:
         peers: tuple[str, ...],
         heartbeat_ms: int,
         connect_timeout_s: float,
+        *,
+        psk: Optional[str] = None,
+        tls: bool = False,
+        tls_certfile: Optional[str] = None,
+        tls_keyfile: Optional[str] = None,
+        tls_ca_file: Optional[str] = None,
+        peer_allowlist: Optional[tuple[str, ...]] = None,
+        max_line_bytes: int = DEFAULT_SIDEBAND_MAX_LINE_BYTES,
     ) -> None:
+        if psk == "":
+            raise ValueError("psk must be non-empty when configured")
+        if max_line_bytes < 1:
+            raise ValueError(f"max_line_bytes must be >= 1; got {max_line_bytes}")
+        if tls and (tls_certfile is None or tls_keyfile is None):
+            raise ValueError("tls=True requires tls_certfile and tls_keyfile")
+
         self.rank_id = rank_id
         self.hostname = hostname
         self.addr = addr
         self.peers = peers
         self.heartbeat_ms = heartbeat_ms
         self.connect_timeout_s = connect_timeout_s
+        self.max_line_bytes = max_line_bytes
+
+        self._psk: Optional[bytes] = psk.encode("utf-8") if psk is not None else None
+        self._tls = tls
+        self._tls_certfile = tls_certfile
+        self._tls_keyfile = tls_keyfile
+        self._tls_ca_file = tls_ca_file
+        self._peer_allowlist: Optional[frozenset[str]] = (
+            frozenset(peer_allowlist) if peer_allowlist is not None else None
+        )
 
         self._local_step_id = 0
         self._local_queue_depth = 0
@@ -135,6 +186,7 @@ class Sideband:
     # -------- lifecycle --------
     async def start(self) -> None:
         host, port = self._parse_addr(self.addr)
+        self._warn_if_insecure_non_loopback_bind(host)
         # Keep a handle on the server so stop() can close the listening
         # socket. asyncio.start_server() returns a Server object; cancelling
         # serve_forever() alone does NOT close the underlying socket —
@@ -143,7 +195,13 @@ class Sideband:
         # mend_shutdown and the next cell in the same container hits
         # EADDRINUSE on the same port (issue observed 2026-05-23 during
         # Track A retry).
-        self._server = await asyncio.start_server(self._handle_inbound, host, port)
+        self._server = await asyncio.start_server(
+            self._handle_inbound,
+            host,
+            port,
+            ssl=self._server_ssl_context(),
+            limit=self.max_line_bytes,
+        )
         self._running = True
         self._tasks.append(asyncio.create_task(self._server.serve_forever()))
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
@@ -177,11 +235,23 @@ class Sideband:
 
     async def _send_to_peer(self, peer: str) -> None:
         host, port = self._parse_addr(peer)
+        ssl_context = self._client_ssl_context()
         try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=self.connect_timeout_s,
-            )
+            if ssl_context is None:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=self.connect_timeout_s,
+                )
+            else:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        host,
+                        port,
+                        ssl=ssl_context,
+                        server_hostname=host,
+                    ),
+                    timeout=self.connect_timeout_s,
+                )
         except (OSError, asyncio.TimeoutError):
             return
         msg = ProgressHeartbeat(
@@ -193,7 +263,7 @@ class Sideband:
             health_bit=self._local_health,
         )
         try:
-            writer.write(json.dumps(asdict(msg)).encode() + b"\n")
+            writer.write(self._encode_heartbeat(msg))
             await writer.drain()
         except (OSError, ConnectionError):
             return
@@ -212,21 +282,189 @@ class Sideband:
         now_us = time.monotonic_ns() // 1000
         try:
             line = await reader.readline()
-        except (OSError, ConnectionError):
+        except (OSError, ConnectionError, ValueError):
             writer.close()
             return
         if not line:
             writer.close()
             return
-        try:
-            payload = json.loads(line.decode())
-            hb = ProgressHeartbeat(**payload)
-        except (json.JSONDecodeError, TypeError, ValueError):
+        if len(line) > self.max_line_bytes:
+            writer.close()
+            return
+        hb = self._decode_heartbeat(line)
+        if hb is None:
             writer.close()
             return
         self._peer_state[hb.rank_id] = hb
         self._peer_last_recv_us[hb.rank_id] = now_us
         writer.close()
+
+    def _encode_heartbeat(self, msg: ProgressHeartbeat) -> bytes:
+        payload: dict[str, object] = asdict(msg)
+        if self._psk is None:
+            return json.dumps(payload).encode() + b"\n"
+
+        body: dict[str, object] = {
+            _HMAC_PAYLOAD_FIELD: payload,
+            _HMAC_NONCE_FIELD: time.monotonic_ns(),
+        }
+        envelope: dict[str, object] = {
+            **body,
+            _HMAC_FIELD: self._hmac_hex(body),
+        }
+        return json.dumps(envelope).encode() + b"\n"
+
+    def _decode_heartbeat(self, line: bytes) -> Optional[ProgressHeartbeat]:
+        try:
+            raw = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+        payload: object
+        if self._psk is None:
+            payload = raw
+        else:
+            signed_payload = self._verify_signed_payload(raw)
+            if signed_payload is None:
+                return None
+            payload = signed_payload
+        return self._heartbeat_from_payload(payload)
+
+    def _verify_signed_payload(self, raw: object) -> Optional[dict[str, object]]:
+        if self._psk is None:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        envelope = cast(dict[object, object], raw)
+        if set(envelope.keys()) != _HMAC_ENVELOPE_FIELDS:
+            return None
+
+        payload = envelope[_HMAC_PAYLOAD_FIELD]
+        nonce = envelope[_HMAC_NONCE_FIELD]
+        received_hmac = envelope[_HMAC_FIELD]
+        if not isinstance(payload, dict):
+            return None
+        if not self._valid_nonnegative_int(nonce):
+            return None
+        if not isinstance(received_hmac, str):
+            return None
+
+        body: dict[str, object] = {
+            _HMAC_PAYLOAD_FIELD: payload,
+            _HMAC_NONCE_FIELD: nonce,
+        }
+        expected_hmac = self._hmac_hex(body)
+        if not hmac.compare_digest(received_hmac, expected_hmac):
+            return None
+        return cast(dict[str, object], payload)
+
+    def _heartbeat_from_payload(self, payload: object) -> Optional[ProgressHeartbeat]:
+        if not isinstance(payload, dict):
+            return None
+        payload_dict = cast(dict[object, object], payload)
+        if set(payload_dict.keys()) != _HEARTBEAT_FIELDS:
+            return None
+
+        rank_id = payload_dict["rank_id"]
+        hostname = payload_dict["hostname"]
+        step_id = payload_dict["step_id"]
+        vector_clock_us = payload_dict["vector_clock_us"]
+        queue_depth = payload_dict["queue_depth"]
+        health_bit = payload_dict["health_bit"]
+        if not self._valid_text(rank_id):
+            return None
+        if not self._valid_text(hostname):
+            return None
+        if not self._valid_nonnegative_int(step_id):
+            return None
+        if not self._valid_nonnegative_int(vector_clock_us):
+            return None
+        if not self._valid_nonnegative_int(queue_depth):
+            return None
+        if not isinstance(health_bit, bool):
+            return None
+        if self._peer_allowlist is not None and rank_id not in self._peer_allowlist:
+            return None
+        return ProgressHeartbeat(
+            rank_id=rank_id,
+            hostname=hostname,
+            step_id=step_id,
+            vector_clock_us=vector_clock_us,
+            queue_depth=queue_depth,
+            health_bit=health_bit,
+        )
+
+    def _hmac_hex(self, body: dict[str, object]) -> str:
+        if self._psk is None:
+            raise RuntimeError("sideband HMAC requested without psk")
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hmac.new(self._psk, canonical, hashlib.sha256).hexdigest()
+
+    def _server_ssl_context(self) -> Optional[ssl.SSLContext]:
+        if not self._tls:
+            return None
+        if self._tls_certfile is None or self._tls_keyfile is None:
+            raise ValueError("tls=True requires tls_certfile and tls_keyfile")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=self._tls_certfile, keyfile=self._tls_keyfile)
+        return context
+
+    def _client_ssl_context(self) -> Optional[ssl.SSLContext]:
+        if not self._tls:
+            return None
+        if self._tls_ca_file is None:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            return context
+        context = ssl.create_default_context(cafile=self._tls_ca_file)
+        context.check_hostname = False
+        return context
+
+    def _warn_if_insecure_non_loopback_bind(self, host: str) -> None:
+        if self._psk is not None:
+            return
+        if self._is_loopback_host(host):
+            return
+        if Sideband._insecure_bind_warning_emitted:
+            return
+        warnings.warn(
+            "tsugi-mend sideband is binding a non-loopback address without "
+            "sideband_psk authentication. This preserves 0.1.x zero-config "
+            "behavior for trusted networks; secure-by-default auth is planned "
+            "for 0.2.0.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        Sideband._insecure_bind_warning_emitted = True
+
+    @staticmethod
+    def _valid_text(value: object) -> TypeGuard[str]:
+        if not isinstance(value, str) or value == "":
+            return False
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return len(encoded) <= _MAX_HEARTBEAT_TEXT_BYTES
+
+    @staticmethod
+    def _valid_nonnegative_int(value: object) -> TypeGuard[int]:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= _MAX_HEARTBEAT_INT
+        )
+
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        normalized = host.strip("[]").lower()
+        if normalized == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(normalized).is_loopback
+        except ValueError:
+            return False
 
     @staticmethod
     def _parse_addr(addr: str) -> tuple[str, int]:

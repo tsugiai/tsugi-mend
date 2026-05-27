@@ -76,6 +76,13 @@ class _MaxRuntime:
                 peers=config.sideband_peers,
                 heartbeat_ms=config.sideband_heartbeat_ms,
                 connect_timeout_s=config.sideband_connect_timeout_s,
+                psk=config.sideband_psk,
+                tls=config.sideband_tls,
+                tls_certfile=config.sideband_tls_certfile,
+                tls_keyfile=config.sideband_tls_keyfile,
+                tls_ca_file=config.sideband_tls_ca_file,
+                peer_allowlist=config.sideband_peer_allowlist,
+                max_line_bytes=config.sideband_max_line_bytes,
             )
         self.diagnostics = DiagnosticsWriter(config.diagnostics_dir)
         self.topology: Optional[Topology] = None

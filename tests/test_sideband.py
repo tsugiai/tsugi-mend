@@ -2,28 +2,73 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import warnings
 
 import pytest
 
-from tsugi_mend.sideband import Sideband
+from tsugi_mend.sideband import ProgressHeartbeat, Sideband
 
 
-def _free_addr_pair() -> tuple[str, str]:
-    """Return two distinct localhost addresses with random free ports."""
+def _free_addrs(count: int) -> tuple[str, ...]:
+    """Return distinct localhost addresses with random free ports."""
     import socket
+
     socks = []
     try:
         addrs: list[str] = []
-        for _ in range(2):
+        for _ in range(count):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
             addrs.append(f"tcp://127.0.0.1:{port}")
             socks.append(s)
-        return addrs[0], addrs[1]
+        return tuple(addrs)
     finally:
         for s in socks:
             s.close()
+
+
+def _free_addr_pair() -> tuple[str, str]:
+    """Return two distinct localhost addresses with random free ports."""
+    addr_a, addr_b = _free_addrs(2)
+    return addr_a, addr_b
+
+
+def _free_addr() -> str:
+    """Return one localhost address with a random free port."""
+    return _free_addrs(1)[0]
+
+
+def _heartbeat_payload(rank_id: str = "rack-peer") -> dict[str, object]:
+    return {
+        "rank_id": rank_id,
+        "hostname": f"host-{rank_id}",
+        "step_id": 7,
+        "vector_clock_us": 123_456,
+        "queue_depth": 2,
+        "health_bit": True,
+    }
+
+
+def _heartbeat_line(rank_id: str = "rack-peer") -> bytes:
+    return json.dumps(_heartbeat_payload(rank_id), separators=(",", ":")).encode() + b"\n"
+
+
+async def _send_raw(addr: str, line: bytes) -> None:
+    host, port = Sideband._parse_addr(addr)
+    _, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(line)
+        await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
 
 
 @pytest.mark.asyncio
@@ -123,3 +168,206 @@ def test_sideband_addr_parse_validation():
     static parser."""
     with pytest.raises(ValueError, match="tcp://"):
         Sideband._parse_addr("udp://1.2.3.4:5")
+
+
+def test_default_no_knob_wire_format_unchanged():
+    sb = Sideband(
+        rank_id="rack-0",
+        hostname="host-a",
+        addr="tcp://127.0.0.1:0",
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+    )
+    msg = ProgressHeartbeat(
+        rank_id="rack-0",
+        hostname="host-a",
+        step_id=1,
+        vector_clock_us=2,
+        queue_depth=3,
+        health_bit=True,
+    )
+
+    assert sb._encode_heartbeat(msg) == (
+        b'{"rank_id": "rack-0", "hostname": "host-a", "step_id": 1, '
+        b'"vector_clock_us": 2, "queue_depth": 3, "health_bit": true}\n'
+    )
+
+
+@pytest.mark.asyncio
+async def test_sideband_rejects_malformed_payloads():
+    addr = _free_addr()
+    sb = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr,
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+    )
+    await sb.start()
+    try:
+        await _send_raw(addr, b"not-json\n")
+        await _send_raw(addr, json.dumps({"rank_id": "missing-fields"}).encode() + b"\n")
+        wrong_type = _heartbeat_payload("wrong-type")
+        wrong_type["step_id"] = "7"
+        await _send_raw(addr, json.dumps(wrong_type).encode() + b"\n")
+        bool_counter = _heartbeat_payload("bool-counter")
+        bool_counter["queue_depth"] = False
+        await _send_raw(addr, json.dumps(bool_counter).encode() + b"\n")
+
+        await asyncio.sleep(0.05)
+        assert sb.peer_snapshot() == {}
+    finally:
+        await sb.stop()
+
+
+@pytest.mark.asyncio
+async def test_sideband_rejects_oversized_line_and_keeps_server_alive():
+    addr = _free_addr()
+    sb = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr,
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+        max_line_bytes=256,
+    )
+    await sb.start()
+    try:
+        await _send_raw(addr, b"x" * 1024 + b"\n")
+        await _send_raw(addr, _heartbeat_line("valid-peer"))
+
+        await asyncio.sleep(0.05)
+        snap = sb.peer_snapshot()
+        assert list(snap) == ["valid-peer"]
+        assert snap["valid-peer"].step_id == 7
+    finally:
+        await sb.stop()
+
+
+@pytest.mark.asyncio
+async def test_sideband_hmac_accepts_matching_psk():
+    addr_sender, addr_receiver = _free_addr_pair()
+    sender = Sideband(
+        rank_id="sender",
+        hostname="host-sender",
+        addr=addr_sender,
+        peers=(addr_receiver,),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        psk="shared-secret",
+    )
+    receiver = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr_receiver,
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        psk="shared-secret",
+    )
+    await receiver.start()
+    await sender.start()
+    try:
+        await asyncio.sleep(0.2)
+        snap = receiver.peer_snapshot()
+        assert "sender" in snap
+        assert snap["sender"].hostname == "host-sender"
+    finally:
+        await sender.stop()
+        await receiver.stop()
+
+
+@pytest.mark.asyncio
+async def test_sideband_hmac_rejects_mismatched_psk():
+    addr_sender, addr_receiver = _free_addr_pair()
+    sender = Sideband(
+        rank_id="sender",
+        hostname="host-sender",
+        addr=addr_sender,
+        peers=(addr_receiver,),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        psk="wrong-secret",
+    )
+    receiver = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr_receiver,
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        psk="shared-secret",
+    )
+    await receiver.start()
+    await sender.start()
+    try:
+        await asyncio.sleep(0.2)
+        assert receiver.peer_snapshot() == {}
+    finally:
+        await sender.stop()
+        await receiver.stop()
+
+
+@pytest.mark.asyncio
+async def test_sideband_peer_allowlist_drops_unknown_rank():
+    addr = _free_addr()
+    sb = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr,
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+        peer_allowlist=("expected-peer",),
+    )
+    await sb.start()
+    try:
+        await _send_raw(addr, _heartbeat_line("unknown-peer"))
+        await asyncio.sleep(0.05)
+        assert sb.peer_snapshot() == {}
+
+        await _send_raw(addr, _heartbeat_line("expected-peer"))
+        await asyncio.sleep(0.05)
+        snap = sb.peer_snapshot()
+        assert list(snap) == ["expected-peer"]
+    finally:
+        await sb.stop()
+
+
+@pytest.mark.asyncio
+async def test_sideband_warns_once_for_non_loopback_bind_without_auth():
+    original_warning_state = Sideband._insecure_bind_warning_emitted
+    Sideband._insecure_bind_warning_emitted = False
+    first = Sideband(
+        rank_id="rank-0",
+        hostname="host-a",
+        addr="tcp://0.0.0.0:0",
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+    )
+    second = Sideband(
+        rank_id="rank-1",
+        hostname="host-b",
+        addr="tcp://0.0.0.0:0",
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+    )
+    try:
+        with pytest.warns(RuntimeWarning, match="non-loopback"):
+            await first.start()
+        await first.stop()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await second.start()
+        assert caught == []
+        await second.stop()
+    finally:
+        await first.stop()
+        await second.stop()
+        Sideband._insecure_bind_warning_emitted = original_warning_state
