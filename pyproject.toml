@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tsugi-mend"
-version = "0.1.0"
+version = "0.1.1"
 description = "tsugiai-mend-sdk. Maximum-uplift cross-rack distributed-training reducer built on Decoupled DiLoCo + DES-LOC + async tensor parallelism + FALCON fail-slow mitigation. Patent-independent by deliberate construction; see LICENSE preamble."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -45,6 +45,9 @@ dev = [
     "mypy>=1.10",
 ]
 
+[project.scripts]
+tsugi-mend = "tsugi_mend.__main__:main"
+
 [project.urls]
 "Homepage" = "https://tsugilabs.ai"
 "Repository" = "https://github.com/tsugiai/tsugi-mend"
@@ -53,6 +56,8 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tsugi_mend"]
+# Ship the PEP 561 marker so downstream type checkers treat the package as typed.
+artifacts = ["src/tsugi_mend/py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
