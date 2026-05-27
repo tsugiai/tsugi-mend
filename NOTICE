@@ -1,0 +1,110 @@
+================================================================
+PATENT POSTURE AND LICENSE-SCOPE NOTICE
+(informational; does not modify the Apache-2.0 license in LICENSE)
+================================================================
+
+Why Apache-2.0 for tsugiai-mend-sdk (NOTICE PREAMBLE)
+
+This SDK (tsugiai-mend-sdk, the "Software") is licensed under the
+Apache License, Version 2.0 ("Apache-2.0"), with its full automatic
+patent grant. See the LICENSE file for the full Apache-2.0 license text.
+
+TsugiCinema, Inc. ("Licensor") publishes a separate, patent-aligned
+SDK at github.com/tsugiai/tsugi-kpool ("tsugiai-kpool-sdk"),
+which is also licensed under the Apache License, Version 2.0. That
+SDK is the implementation of two TsugiCinema US provisional patents
+(US App. 64/060,315 K-Pool LoRA and US App. 64/055,093 Infinity) at
+LoRA-adapter granularity. The Apache-2.0 patent grant in Section 3 on
+that SDK extends to those patent estates as practiced by the SDK code
+as distributed, bounded by Section 3's "necessarily infringed by their
+Contribution" language.
+
+THIS SDK (tsugiai-mend-sdk) IS A DELIBERATELY SEPARATE WORK. It does
+not exercise either of TsugiCinema's two patent estates listed
+above. It is an integration of public-art techniques:
+
+  - Decoupled DiLoCo (Douillard et al., arXiv:2604.21428, April 2026)
+  - DES-LOC / Local Adam (Iacob et al., arXiv:2505.22549, May 2025)
+  - Async Tensor Parallelism (PyTorch / TorchTitan, September 2024)
+  - FALCON fail-slow mitigation (arXiv:2410.12588, October 2024)
+
+Because this SDK does not exercise TsugiCinema's K-Pool LoRA or
+Infinity patents, the Apache-2.0 automatic patent grant on this SDK
+does not extend a license to either of those patent estates. Users who wish to use the patent-aligned mechanisms
+covered by US App. 64/060,315 or US App. 64/055,093 (variance-
+threshold trigger, K-of-N adapter routing with sideband-coordinated
+elastic buffer, etc.) should engage with TsugiCinema separately;
+those mechanisms are NOT present in this SDK and the Apache-2.0
+grant on this SDK does not reach them.
+
+The two SDKs share zero code. This SDK was scoped on 2026-05-21 to
+maximize measured throughput uplift on cross-rack distributed
+training using public-art techniques only, so that the Apache-2.0
+patent grant could be granted without scoping and without leaking
+the patent moat carried by tsugiai-kpool-sdk.
+
+================================================================
+
+tsugiai-mend-sdk
+Copyright 2026 TsugiCinema, Inc.
+
+This product includes software developed by TsugiCinema, Inc. and is
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This software composes public prior art from the following sources.
+Each citation is to the published reference describing the technique
+exercised in this codebase; the implementation here is original
+TsugiCinema, Inc. code that reproduces the published mechanism.
+
+1. Cross-rack reducer (GraceWindowSyncer state machine).
+   Decoupled DiLoCo: Continual Pre-Training of Language Models
+   without Aggregator Synchronization.
+   Douillard, A.; Donchev, A.; Rush, A.; Riedel, S. (2026).
+   arXiv:2604.21428.
+
+2. Desynchronized optimizer momenta (DES-LOC).
+   Local Adam: Globally-Sparse Local Updates for Distributed Adam.
+   Mishchenko, K. et al. (2025). arXiv:2505.22549.
+
+3. Async tensor parallelism (intra-node async-TP overlap hooks).
+   TorchTitan: PyTorch Pre-training Native Library.
+   Wanchao Liang, Tianyu Liu, Less Wright, Will Constable,
+   Andrew Gu, Chien-Chin Huang, Iris Zhang, Wei Feng,
+   Howard Huang, Junjie Wang, Sanket Purandare, Gokul Nadathur,
+   Stratos Idreos. PyTorch (2024). https://github.com/pytorch/torchtitan
+
+4. Fail-slow detection (FALCON sliding-window z-score).
+   FALCON: Pinpointing and Mitigating Stragglers for Large-Scale
+   Hybrid-Parallel Training.
+   Wu, T. et al. (2024). arXiv:2410.12588.
+
+5. Optional gradient compression (PowerSGD with error feedback).
+   PowerSGD: Practical Low-Rank Gradient Compression for Distributed
+   Optimization.
+   Vogels, T.; Karimireddy, S. P.; Jaggi, M. (2019).
+   NeurIPS 2019. arXiv:1905.13727.
+   The PowerSGD primitive in `src/tsugi_mend/compression.py` is a
+   from-scratch reproduction of the rank-r power-iteration algorithm
+   with persistent error feedback. PyTorch's native
+   `torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook` was
+   considered but is DDP-bucket-bound and not directly reusable for
+   the GraceWindowSyncer fragment-merge path.
+
+6. Concurrent outer-step orchestrator (Phase 2 Week 1 marquee feature).
+   Original TsugiCinema, Inc. work. The orchestrator wraps the
+   Decoupled DiLoCo control law (item 1) in an asyncio-task-based
+   pattern that overlaps the cross-rack grace window with inner-step
+   forward/backward compute. Convergence-equivalent to Decoupled
+   DiLoCo by Algorithm 2 staggering analysis; see
+   `docs/phase2_week1_async_tp_overlap.md` for the proof sketch.
+
+Patent posture:
+The Apache-2.0 license grants a full automatic patent grant on the
+techniques exercised in this codebase. The mend SDK is patent-
+independent by deliberate construction; it does NOT exercise the
+K-Pool LoRA (US App. 64/060,315) or Infinity (US App. 64/055,093)
+patent estates owned by TsugiCinema, Inc. Those mechanisms (variance-
+threshold trigger; K-of-N adapter routing; elastic-adapter-buffer
+quorum-based merge) live in the companion patent-aligned SDK at
+github.com/tsugiai/tsugi-kpool and are not present in this
+repository.

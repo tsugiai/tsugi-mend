@@ -1,0 +1,132 @@
+# tsugi-mend
+
+[![PyPI version](https://img.shields.io/pypi/v/tsugi-mend.svg)](https://pypi.org/project/tsugi-mend/)
+[![Python versions](https://img.shields.io/pypi/pyversions/tsugi-mend.svg)](https://pypi.org/project/tsugi-mend/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/tsugiai/tsugi-mend/actions/workflows/ci.yml/badge.svg)](https://github.com/tsugiai/tsugi-mend/actions/workflows/ci.yml)
+
+Maximum-uplift cross-rack distributed-training reducer for PyTorch.
+
+A software-only drop-in that replaces the cross-rack data-parallel
+all-reduce with an integration of public-art techniques designed to
+maximize measured tokens-per-second uplift on realistic cross-rack
+topology:
+
+- **Decoupled DiLoCo** (Douillard et al., arXiv:2604.21428, April 2026): independent asynchronous learners, minimum quorum, adaptive grace window, token-weighted merge.
+- **DES-LOC / Local Adam** (Iacob et al., arXiv:2505.22549, May 2025; ICLR 2026): desynchronized synchronization periods for adaptive-optimizer momenta.
+- **Async tensor parallelism** (PyTorch / TorchTitan, September 2024): intra-node overlap of all-gather / reduce-scatter with matmul.
+- **FALCON fail-slow mitigation** (arXiv:2410.12588, October 2024): sliding-window z-score detection of slow nodes to exclude them from the current quorum round.
+
+The SDK keeps intra-rack TP / CP / PP / FSDP collectives unchanged (vanilla NCCL inside the NVLink domain) and replaces only the off-rack DP boundary with the four-paper stack above.
+
+## Install
+
+```bash
+pip install tsugi-mend
+```
+
+Or install the unified surface that bundles this SDK with the companion patent-aligned SDK:
+
+```bash
+pip install tsugi   # exposes tsugi.mend and tsugi.kpool
+```
+
+For local development:
+
+```bash
+pip install -e ".[dev]"
+```
+
+## License and IP posture
+
+This SDK is licensed under **Apache-2.0** with its full automatic patent grant. The SDK is patent-independent by deliberate construction: it does not exercise the K-Pool LoRA (US App. 64/060,315) or Infinity (US App. 64/055,093) patent estates that the companion SDK (`tsugi-kpool`, also Apache-2.0) does. Read the preamble at the top of the `LICENSE` file for the full posture explanation.
+
+The companion patent-aligned SDK at [`github.com/tsugiai/tsugi-kpool`](https://github.com/tsugiai/tsugi-kpool) is the software embodiment of those two TsugiCinema patent estates. The two SDKs share zero code.
+
+## Measurements
+
+The numbers below are first-party internal benchmark measurements taken
+under the reproduction contract in [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md)
+(same workload / checkpoint / hardware, baseline vs SDK, paired runs,
+bootstrap 95% CI). The raw per-run results logs are internal; the
+protocol document is the public reproduction pointer, and the headline
+cells below can be re-derived by anyone who runs the protocol on the
+stated hardware. We report point estimates with their 95% CI where
+available and flag single-seed (n=1) cells explicitly.
+
+| Workload | Hardware | Measurement |
+|---|---|---|
+| **Statistical-confidence headline (Hopper 3-seed CI)** | Modal H100:1, Qwen-2.5-1.5B, 200 steps × 3 seeds at 2000ms grace window | **+71.49% ± 2.83% (95% CI, n=3)** throughput uplift |
+| Cross-rack grace-window overlap on Hopper at 7B scale | Modal H100:1, Qwen-2.5-7B, 200 steps × 5 delays | +76.58% at 2000ms; +39.72% at 1000ms; +19.20% at 500ms |
+| Intermediate model-scale (3B) confirmation (Hopper 3-seed CI) | Modal H100:1, Qwen-2.5-3B, 200 steps × 4 delays × 3 seeds | +41.31% ± 0.29% at 2000ms (n=3); +20.40% ± 0.03% at 1000ms; +9.75% ± 0.04% at 500ms |
+| Cross-rack grace-window overlap at 1.5B scale | Modal H100:1, Qwen-2.5-1.5B, 200 steps × 7 delays | +70.64% at 2000ms; +34.73% at 1000ms; +16.86% at 500ms |
+| Cross-rack grace-window overlap on A10G | Modal A10G, SmolLM-135M, 200 steps × 7 delays | +52.75% at 2000ms (constant); +11.61% at 500ms; -0.06% overhead at 0ms; bit-exact loss preserved across all cells |
+| Production-realistic multi-GPU FSDP + 7B model (3-seed CI) | Modal 8xH100 FSDP FULL_SHARD, Qwen-2.5-7B + simulated 2-rack, 4 delays × 3 seeds | +6.37% ± 1.31% at 2000ms (n=3) |
+| **Real cross-network 2-node 8xV100 (synchronous reducer)** | Lambda Labs commodity Ethernet, SmolLM-135M, 500 paired steps | **+28.58% tokens-per-second uplift vs vanilla FSDP, bit-exact-identical loss** |
+| H100 Hopper single-instance (synchronous reducer baseline) | Modal 8x H100 SXM5, Llama-3-8B, 2000 paired steps × 3 seeds | -0.97% ± 1.5% (predicted null; Hopper NVLink absorbs the synchronous-path cross-rack tax) |
+| Real cross-network 2-pod 8xH100 (production-fabric floor; n=1) | RunPod 2x 8x H100 SXM5 over real InfiniBand / RoCE v2 3.2 Tbps, Llama-3-8B, 500 paired steps × 1 seed | +1.42% tps + 0.18% loss delta (effectively bit-exact); **n=1 caveat is load-bearing** (same order of magnitude as baseline-only seed variance); n=3 CI pending |
+
+How to read these numbers honestly:
+
+- The **+71.49% ± 2.83% (n=3) Hopper headline** is a single-instance measurement with an injected (simulated) grace-window delay, NOT a real cross-network result; read it as a ceiling-case for the overlap mechanism rather than a production number. The orchestrator's uplift is governed by `N · T_step / G` (sync-period steps × per-step compute time vs grace-window ms). Apparent non-monotonicity with model size (Qwen-3B +41.31% below both Qwen-1.5B and Qwen-7B) is explained by the Qwen-7B measurement using 1/8 the tokens-per-step (seq_len 1024 / mbs 1 vs 2048 / 4); at fixed tokens-per-step, uplift is monotonically decreasing in model size.
+- The **+28.58% real cross-network V100** result is the most defensible production-grounded headline: it is a real 2-node cross-Ethernet measurement (not a simulated delay) with bit-exact loss.
+- Production-realistic multi-GPU FSDP yields a smaller honest floor (**+6.37% ± 1.31%, n=3**) because 8-rank NCCL pipelining absorbs some of the simulated delay.
+- Constant-delay headlines (e.g. +52.75% A10G at 2000ms) are ceiling-case stress tests. The FALCON paper documents cross-rack inter-node RDMA variance (CoV=0.29) but does not characterize the per-iteration latency distribution shape; the delay sweep is a stress test, not a literal FALCON replay.
+
+At every scale the concurrent path's throughput is rock-solid across delays (Qwen-7B single-process: 4,300 ± 80 tok/s; Qwen-3B Hopper: 18,153 ± 4 tok/s; Qwen-1.5B Hopper: 30,840 ± 35 tok/s; SmolLM-135M A10G: 23,610 ± 80 tok/s) while the synchronous baseline collapses linearly with delay.
+
+## Status
+
+**Pre-Alpha (0.1.0).** APIs are stabilizing and may change before v1.0. Published to PyPI as `tsugi-mend`; also reachable through the unified `tsugi` meta-package as `tsugi.mend`. The staged validation (Stage A unit/integration through cross-network production-fabric runs) all passed under the protocol above; the real-fabric Hopper cross-network result is point-estimate closed (n=1), with an n=3 CI pending.
+
+## Quickstart
+
+```python
+from tsugi_mend import MendConfig, mend_init, mend_shutdown
+
+config = MendConfig(
+    quorum_min_learners=4,
+    grace_window_ms=2000,
+    token_weighted_merge=True,
+    sync_period_steps=128,
+    momentum_sync_period_steps=512,
+    async_tp_enabled=True,
+    # Orchestrator overlaps the cross-rack outer-step wait with inner-step
+    # async-TP compute. Default True.
+    concurrent_outer_step=True,
+    failslow_zscore_threshold=3.0,
+    failslow_window_steps=50,
+    rack_aware=True,
+    sideband_addr="tcp://0.0.0.0:51900",
+    sideband_peers=("tcp://peer1:51900", "tcp://peer2:51900"),
+    sideband_heartbeat_ms=100,
+    diagnostics_dir="./results/mend_diag",
+)
+
+mend_init(model, config)
+# ... train normally ...
+mend_shutdown(model)
+```
+
+Two runnable, CPU-only integration examples (no GPU or multi-node required):
+
+- [`examples/minimal_single_process.py`](examples/minimal_single_process.py) - smallest end-to-end use on a toy `nn.Module`.
+- [`examples/concurrent_orchestrator.py`](examples/concurrent_orchestrator.py) - wiring the `ConcurrentOuterStep` orchestrator into a training loop with a synthetic single-rank fragment provider.
+
+```bash
+python examples/minimal_single_process.py
+python examples/concurrent_orchestrator.py
+```
+
+## Layout
+
+```
+src/tsugi_mend/   SDK source
+tests/            unit and integration tests (CPU-only)
+docs/             architecture, benchmark protocol, convergence-equivalence sketch
+examples/         minimal CPU-only training-loop integration examples
+```
+
+## Companion SDK
+
+For LoRA-adapter-granularity productization that exercises the K-Pool LoRA and Infinity patent estates, see [`tsugi-kpool`](https://github.com/tsugiai/tsugi-kpool). The two SDKs share zero code and can be installed and used independently, or together via the unified [`tsugi`](https://github.com/tsugiai/tsugi) meta-package.

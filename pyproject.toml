@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tsugi-mend"
+version = "0.1.0"
+description = "tsugiai-mend-sdk. Maximum-uplift cross-rack distributed-training reducer built on Decoupled DiLoCo + DES-LOC + async tensor parallelism + FALCON fail-slow mitigation. Patent-independent by deliberate construction; see LICENSE preamble."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Tong Liu", email = "tong@tsugicinema.com" }]
+keywords = ["pytorch", "distributed-training", "cross-rack", "decoupled-diloco", "des-loc", "async-tp", "failslow"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+benchmark = [
+    "transformers>=4.45",
+    "accelerate>=0.34",
+    "datasets>=2.20",
+    "evaluate>=0.4",
+    "pyyaml>=6.0",
+    "sentencepiece>=0.2",
+    "protobuf>=4.25",
+    "matplotlib>=3.8",
+    "scipy>=1.13",
+    "hf-transfer>=0.1",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.urls]
+"Homepage" = "https://tsugilabs.ai"
+"Repository" = "https://github.com/tsugiai/tsugi-mend"
+"Unified-SDK" = "https://github.com/tsugiai/tsugi"
+"Companion-SDK-Patent-Aligned" = "https://github.com/tsugiai/tsugi-kpool"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tsugi_mend"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
