@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from tsugi_mend.sideband import DEFAULT_SIDEBAND_MAX_LINE_BYTES
+
 
 @dataclass
 class MendConfig:
@@ -187,6 +189,16 @@ class MendConfig:
     sideband_heartbeat_ms: int = 100
     # Sub-second connect timeout for sideband peer dial.
     sideband_connect_timeout_s: float = 0.5
+    # Sideband security remains opt-in for 0.1.x to preserve the
+    # zero-config trusted-network UX. Secure-by-default auth is planned
+    # for 0.2.0.
+    sideband_psk: Optional[str] = None
+    sideband_peer_allowlist: Optional[tuple[str, ...]] = None
+    sideband_max_line_bytes: int = DEFAULT_SIDEBAND_MAX_LINE_BYTES
+    sideband_tls: bool = False
+    sideband_tls_certfile: Optional[str] = None
+    sideband_tls_keyfile: Optional[str] = None
+    sideband_tls_ca_file: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -244,6 +256,25 @@ class MendConfig:
                 raise ValueError(
                     f"sideband_peers entries must start with tcp://; got {peer!r}"
                 )
+        if self.sideband_psk == "":
+            raise ValueError("sideband_psk must be non-empty when configured")
+        if self.sideband_peer_allowlist is not None:
+            for rank_id in self.sideband_peer_allowlist:
+                if not isinstance(rank_id, str) or rank_id == "":
+                    raise ValueError(
+                        "sideband_peer_allowlist entries must be non-empty strings"
+                    )
+        if self.sideband_max_line_bytes < 1:
+            raise ValueError(
+                f"sideband_max_line_bytes must be >= 1; got {self.sideband_max_line_bytes}"
+            )
+        if self.sideband_tls and (
+            self.sideband_tls_certfile is None or self.sideband_tls_keyfile is None
+        ):
+            raise ValueError(
+                "sideband_tls=True requires sideband_tls_certfile and "
+                "sideband_tls_keyfile"
+            )
         if self.simulated_merge_delay_distribution not in (
             "constant", "bimodal", "long_tail",
         ):
