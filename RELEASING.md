@@ -40,8 +40,8 @@ done by hand. They are intentionally NOT in any workflow file.
 
 ## Cutting a release
 
-The release pipeline runs on a published GitHub Release (recommended) and also on
-any pushed `v*` tag. Version is set in `pyproject.toml`.
+The release pipeline runs on a published GitHub Release. Version is set in
+`pyproject.toml`.
 
 1. Bump `version` in `pyproject.toml` (e.g. `0.1.0 -> 0.1.1`) and commit on `main`
    via the normal PR flow. (This PR does NOT bump the version; the workflow is
@@ -56,7 +56,8 @@ any pushed `v*` tag. Version is set in `pyproject.toml`.
    gh release create v0.1.1 --title "v0.1.1" --notes "..."
    ```
 
-   The tag and the `pyproject.toml` version should match.
+   Publishing the GitHub Release triggers `.github/workflows/release.yml`. The
+   tag and the `pyproject.toml` version should match.
 
 3. The `Release` workflow then:
    - builds the sdist + wheel with `python -m build`,
