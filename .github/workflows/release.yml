@@ -1,0 +1,72 @@
+name: Release
+
+# Publish tsugi-mend to PyPI via OIDC Trusted Publishing.
+#
+# Tokenless by design: PyPI verifies a short-lived OIDC identity GitHub Actions
+# mints for THIS repo + workflow. There is NO API token, no `password:`, and no
+# secret anywhere in this file. The build job holds no publishing identity; only
+# the separate publish job is granted id-token:write (PyPA-recommended job
+# isolation). See RELEASING.md for the one-time Trusted-Publisher registration
+# the maintainer must perform on PyPI before the first release.
+
+on:
+  release:
+    types: [published]
+
+# Default-deny for the whole workflow; each job opts into exactly what it needs.
+permissions: {}
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI (Trusted Publishing)
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tsugi-mend/
+    permissions:
+      id-token: write   # required for OIDC Trusted Publishing; no token/secret used
+      contents: read    # to download the build artifact
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        # Pinned to an immutable release tag of the official PyPA publish action.
+        uses: pypa/gh-action-pypi-publish@v1.14.0
+        with:
+          packages-dir: dist/
