@@ -26,10 +26,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 import torch
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from random import Random
 
 
 @dataclass
@@ -156,14 +159,14 @@ class GraceWindowSyncer:
         quorum_min_learners: int,
         grace_window_ms: int,
         token_weighted: bool = True,
-        clock=None,
+        clock: Callable[[], float] | None = None,
         simulated_merge_delay_ms: int = 0,
         simulated_merge_delay_distribution: str = "constant",
     ) -> None:
         self.quorum_min = quorum_min_learners
         self.grace_window_ms = grace_window_ms
         self.token_weighted = token_weighted
-        self._clock = clock or time.monotonic
+        self._clock: Callable[[], float] = clock or time.monotonic
         self._state: Optional[_SyncerState] = None
         # Phase 2 Week 1 Day 4-7: optional injectable delay inside _finalize.
         # Stress-test for the orchestrator's overlap budget against a
@@ -268,12 +271,12 @@ class GraceWindowSyncer:
         )
         return self._finalize(reason="quorum_satisfied", elapsed_grace_ms=elapsed_ms)
 
-    def set_clock(self, clock) -> None:
+    def set_clock(self, clock: Callable[[], float]) -> None:
         """Test hook: replace the monotonic clock with a callable. Used by
         the deterministic unit tests."""
         self._clock = clock
 
-    def set_delay_rng(self, rng) -> None:
+    def set_delay_rng(self, rng: Random) -> None:
         """Test hook: replace the delay-sampling RNG. Used by the
         deterministic unit tests so the bimodal / long-tail distribution
         sampling is reproducible."""

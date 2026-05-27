@@ -65,7 +65,7 @@ equivalence with the vanilla baseline.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 from torch import Tensor
@@ -201,7 +201,7 @@ def powersgd_compress_delta(
     approx = P @ Q.t()
     # Persist the compression error for the next call.
     state.residuals[res_key] = (G - approx).detach()
-    return approx.reshape(orig_shape).to(orig_dtype)
+    return cast(Tensor, approx.reshape(orig_shape).to(orig_dtype))
 
 
 def int8_quantize_delta(tensor: Tensor) -> Tensor:
