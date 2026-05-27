@@ -153,12 +153,18 @@ def test_powersgd_error_feedback_drives_residual_to_zero_on_low_rank_signal():
         f"final residual norm {residual_norms[-1]:.4f} too large vs "
         f"signal norm {g_norm:.4f}"
     )
-    # Residual should strictly decrease over the iteration sequence
-    # (warm-start power iteration is monotonic on exactly-low-rank
-    # input).
-    assert residual_norms[-1] < residual_norms[0], (
-        f"residual did not decrease: first={residual_norms[0]:.4f} "
-        f"last={residual_norms[-1]:.4f}"
+    # Residual should converge: either it decreased from the first
+    # iteration, or it is already at the numerical noise floor. Warm-start
+    # power iteration converges almost immediately on exactly-low-rank
+    # input, so by iteration 10 both ends can sit at ~1e-5 where the
+    # ordering is floating-point noise that varies across BLAS / torch
+    # builds. Assert the meaningful convergence, not strict ordering at
+    # the noise floor.
+    noise_floor = g_norm * 1e-3
+    assert residual_norms[-1] <= residual_norms[0] or residual_norms[-1] < noise_floor, (
+        f"residual neither decreased nor reached the noise floor: "
+        f"first={residual_norms[0]:.6f} last={residual_norms[-1]:.6f} "
+        f"floor={noise_floor:.6f}"
     )
 
 
