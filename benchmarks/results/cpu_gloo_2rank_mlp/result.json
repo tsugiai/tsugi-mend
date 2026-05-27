@@ -1,0 +1,76 @@
+{
+  "schema_version": "1.0",
+  "cell": "cpu_gloo_2rank_mlp",
+  "reproducible": "cheap",
+  "protocol": "docs/benchmark_protocol.md",
+  "hardware": {
+    "label": "local CPU (gloo); $0 cheap reproducible cell",
+    "platform": "macOS-26.3.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.12.13",
+    "torch": "2.12.0",
+    "backend": "gloo",
+    "ranks": 2
+  },
+  "workload": {
+    "kind": "synthetic-mlp-regression",
+    "model_id": null,
+    "tokenizer_id": null,
+    "dataset_id": null,
+    "batch": 256,
+    "in_dim": 512,
+    "hidden": 1024,
+    "out_dim": 128,
+    "tokens_per_step": 131072,
+    "optimizer": "SGD",
+    "lr": 0.05,
+    "seed": 20240527
+  },
+  "sdk_config": {
+    "quorum_min_learners": 2,
+    "grace_window_ms": 0,
+    "sync_period_steps": 10,
+    "apply_lag_steps": 6,
+    "simulated_merge_delay_ms": 12,
+    "outer_step_compression_mode": "none",
+    "concurrent_outer_step": true,
+    "token_weighted_merge": true
+  },
+  "run": {
+    "steps": 160,
+    "warmup_steps": 20,
+    "n_steady_steps": 140
+  },
+  "bit_exact_loss_equivalence": {
+    "passed": true,
+    "method": "elementwise IEEE-754 equality over per-step loss (rank 0), default lossless mode",
+    "n_steps_compared": 160,
+    "first_baseline_loss": 1.0055588483810425,
+    "last_baseline_loss": 0.9953196048736572,
+    "max_abs_loss_diff": 0.0
+  },
+  "metrics": {
+    "baseline": {
+      "tokens_per_second": 13247624.446191423,
+      "mean_step_time_ms": 9.89400028151327,
+      "p50_step_time_ms": 6.834166473709047,
+      "p95_step_time_ms": 37.90999176562764,
+      "p99_step_time_ms": 40.35475882468744
+    },
+    "sdk": {
+      "tokens_per_second": 15170683.374920867,
+      "mean_step_time_ms": 8.639821737805116,
+      "p50_step_time_ms": 7.126229000277817,
+      "p95_step_time_ms": 18.677060748450458,
+      "p99_step_time_ms": 22.530783426482216
+    },
+    "uplift": {
+      "tokens_per_second_pct": 14.516254869244193,
+      "ci95_low_pct": 3.407066055057051,
+      "ci95_high_pct": 25.261787805801877,
+      "n_paired_steps": 140,
+      "n_bootstrap_resamples": 10000,
+      "confidence": 0.95
+    }
+  }
+}

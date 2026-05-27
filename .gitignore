@@ -66,6 +66,12 @@ wandb/
 *.bin
 *.safetensors
 
+# ...but DO track the committed benchmark result bundles (small JSON +
+# README under benchmarks/results/<cell>/). These are the public-safe
+# reproduction artifacts, not transient diagnostics dumps.
+!benchmarks/results/
+!benchmarks/results/**
+
 # HuggingFace cache (if user pins it under repo)
 .cache/
 hf_cache/
