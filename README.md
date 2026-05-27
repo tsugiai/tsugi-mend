@@ -103,7 +103,7 @@ See [`docs/multinode.md`](docs/multinode.md) for the multi-node launch walkthrou
 
 ## Status
 
-**Pre-Alpha (0.1.0).** APIs are stabilizing and may change before v1.0. Published to PyPI as `tsugi-mend`; also reachable through the unified `tsugi` meta-package as `tsugi.mend`. The staged validation (Stage A unit/integration through cross-network production-fabric runs) all passed under the protocol above; the real-fabric Hopper cross-network result is point-estimate closed (n=1), with an n=3 CI pending.
+**Pre-Alpha (0.1.1).** APIs are stabilizing and may change before v1.0. Published to PyPI as `tsugi-mend`; also reachable through the unified `tsugi` meta-package as `tsugi.mend`. The staged validation (Stage A unit/integration through cross-network production-fabric runs) all passed under the protocol above; the real-fabric Hopper cross-network result is point-estimate closed (n=1), with an n=3 CI pending.
 
 ## Quickstart
 

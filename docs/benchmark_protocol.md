@@ -1,6 +1,6 @@
 # Benchmark protocol
 
-This document is the reproduction contract for any tsugiai-mend-sdk measurement that ends up in a published artifact (paper, blog post, results doc).
+This document is the reproduction contract for any tsugi-mend measurement that ends up in a published artifact (paper, blog post, results doc).
 
 ## Cardinal rule
 

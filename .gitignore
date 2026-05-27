@@ -73,3 +73,7 @@ hf_cache/
 # Local environment files
 .env
 .env.local
+
+# uv
+uv.lock
+.venv/

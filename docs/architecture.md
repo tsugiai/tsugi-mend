@@ -25,7 +25,7 @@
 
 | Component | Public reference | What it implements |
 |---|---|---|
-| `concurrent.ConcurrentOuterStep` | Phase 2 Week 1 (2026-05-22): orchestration layer above GraceWindowSyncer; asyncio-task-based; lets cross-rack outer-step run concurrently with inner-step async-TP. Wraps the published Decoupled DiLoCo control law without modifying it. Patent-independent. | submit_async / collect / state-machine IDLE/PENDING/READY/FAILED |
+| `concurrent.ConcurrentOuterStep` | Orchestration layer above GraceWindowSyncer; asyncio-task-based; lets the cross-rack outer-step run concurrently with inner-step async-TP. Wraps the published Decoupled DiLoCo control law without modifying it. Patent-independent. | submit_async / collect / state-machine IDLE/PENDING/READY/FAILED |
 | `reducer.GraceWindowSyncer` | Decoupled DiLoCo, arXiv:2604.21428 | minimum quorum, adaptive grace window, token-weighted merge |
 | `desync_optimizer.DesynchronizedSyncSchedule` | DES-LOC, arXiv:2505.22549 | params sync every N inner steps; momenta sync every M >= N |
 | `async_tp.enable_async_tp` | PyTorch / TorchTitan async-TP, September 2024 | best-effort enabling of TorchTitan's intra-node async-TP path |
@@ -46,11 +46,11 @@ None of these mechanisms exercise TsugiCinema's K-Pool LoRA (App. 64/060,315) or
 
 ## What is intentionally not here
 
-- LoRA-adapter-granularity reduction. The companion `tsugiai-kpool-sdk` covers that; this SDK operates at full-parameter granularity.
+- LoRA-adapter-granularity reduction. The companion `tsugi-kpool` covers that; this SDK operates at full-parameter granularity.
 - Variance-threshold convergence triggers. That belongs to the Infinity patent estate; this SDK uses the grace-window trigger from Decoupled DiLoCo instead.
 - K-of-N adapter routing. That belongs to the K-Pool LoRA patent estate; this SDK does not select a subset of model components per step.
-- Custom C++ NCCL ProcessGroup. Python-level integration is sufficient for the Stages B-E roadmap.
-- Multi-rack 3+ rack reducer optimization. The current GraceWindowSyncer handles N >= 2 racks; Stage E targets 2 racks; production 4+ rack support is a Phase 2 productization track.
+- Custom C++ NCCL ProcessGroup. Python-level integration is sufficient for the current roadmap.
+- Multi-rack 3+ rack reducer optimization. The current GraceWindowSyncer handles N >= 2 racks; production 4+ rack support is future work.
 
 ## File-by-file reading order
 
@@ -67,9 +67,9 @@ For someone joining this codebase, read in this order:
 
 ## Companion SDK boundary
 
-The patent-aligned `tsugiai-kpool-sdk` exists at a different layer:
+The patent-aligned `tsugi-kpool` exists at a different layer:
 
-| Concept | tsugiai-mend-sdk | tsugiai-kpool-sdk |
+| Concept | tsugi-mend | tsugi-kpool |
 |---|---|---|
 | Granularity | full-model parameters | LoRA adapter parameters only |
 | Convergence trigger | Decoupled DiLoCo grace window | variance threshold on adapter snapshots |

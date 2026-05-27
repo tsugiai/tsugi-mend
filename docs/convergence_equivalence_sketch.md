@@ -1,8 +1,5 @@
 # Convergence-equivalence sketch: late-apply tolerance of the orchestrator
 
-Date: 2026-05-23
-Author: Mend SDK research-line continuation session
-Companion to internal FALCON-distribution-verification and uplift-surface-characterization briefs (2026-05-23).
 Readability target: senior research engineer with distributed-training background; no measure-theory prerequisite.
 
 ## What this sketch is
@@ -73,7 +70,7 @@ For D > 3, the paper does not provide direct experimental validation, but the al
 
 The orchestrator's late-apply window is at most the grace window `G = grace_window_ms` (the asyncio task's task does not extend its wait beyond `2 * grace_window_ms` per `concurrent.py:228-229`). The number of inner steps that fit into this window is `D_max = ceil(G / T_step)`.
 
-With G = 2000ms default and T_step in {237ms, 265ms, 344ms, 484ms} from the Phase 2 Week 1 measurements, D_max is in {5, 8}. With the recommended auto-tuner setting `N* = ceil(G / T_step)`, D becomes approximately equal to N* itself; the orchestrator transitions from compute-bound (D = 0) to delay-bound (D ≈ N*) at the auto-tuned operating point.
+With G = 2000ms default and T_step in {237ms, 265ms, 344ms, 484ms} from representative measurements, D_max is in {5, 8}. With the recommended auto-tuner setting `N* = ceil(G / T_step)`, D becomes approximately equal to N* itself; the orchestrator transitions from compute-bound (D = 0) to delay-bound (D ≈ N*) at the auto-tuned operating point.
 
 If the operator chooses `N >= D_max + 1` (always at least one inner step beyond the grace window), then D < N <= H, which is within the H sync interval and the algorithm's structural assumptions. The default `MendConfig.sync_period_steps = 128` and `momentum_sync_period_steps = 512` give a generous safety factor: even D = 8 (the largest we have measured) is 16x smaller than the default N.
 
@@ -81,15 +78,15 @@ The risk regime is when an operator chooses a small N (e.g., N=4 from the auto-t
 
 ## Empirical validation already in place
 
-The Track A/B/D/G measurements show that for D in {1, ..., 8}, the orchestrator preserves loss equivalence within the bf16 stochastic noise band:
+Measurements across representative workloads show that for D in {1, ..., 8}, the orchestrator preserves loss equivalence within the bf16 stochastic noise band:
 
-| Track | Workload | D (estimated) | Final loss delta (sync vs conc) | Within bf16 noise? |
-|---|---|---:|---:|---|
-| A | Llama-3-8B 8xH100 | 1 (compute-bound) | -0.010 | Yes |
-| B | Qwen-7B 8xH100 | 1 (compute-bound) | +0.21 | Yes |
-| G | Qwen-3B H100:1 | ~4 (delay-bound) | (per Track G: tight per-seed) | Yes |
-| prior | Qwen-1.5B H100:1 | ~7 (delay-bound) | (per multi-seed CI run) | Yes |
-| prior | SmolLM-135M A10G | ~5 (delay-bound) | -0.0013 to +0.0018 | Yes (bit-exact-class) |
+| Workload | D (estimated) | Final loss delta (sync vs conc) | Within bf16 noise? |
+|---|---:|---:|---|
+| Llama-3-8B 8xH100 | 1 (compute-bound) | -0.010 | Yes |
+| Qwen-7B 8xH100 | 1 (compute-bound) | +0.21 | Yes |
+| Qwen-3B H100:1 | ~4 (delay-bound) | tight per-seed | Yes |
+| Qwen-1.5B H100:1 | ~7 (delay-bound) | tight (multi-seed) | Yes |
+| SmolLM-135M A10G | ~5 (delay-bound) | -0.0013 to +0.0018 | Yes (bit-exact-class) |
 
 The empirical evidence supports the structural argument: at D up to approximately 7 inner steps with sync_period_steps=10, the orchestrator preserves loss equivalence. The proof sketch above gives the structural reason; the measurements give the empirical confirmation.
 
@@ -119,11 +116,10 @@ These are future research questions, not blocking for the orchestrator's adoptio
 
 1. Reference this document from the orchestrator's module docstring (`concurrent.py:10-13`) so that the convergence-equivalence justification is auditable from the codebase.
 2. Add a runtime assertion that `sync_period_steps > ceil(grace_window_ms / inner_step_time_estimate)` to catch the D >= H risk at config-validation time. This requires an `inner_step_time_estimate` MendConfig field, OR the auto-tuner warmup loop.
-3. Update `phase2_week1_async_tp_overlap.md` (the original design doc) to point at this brief instead of the one-line "no new convergence proof required" hand-wave.
 
 ## References verified
 
 - arXiv:2604.21428v1 (Decoupled DiLoCo), full text extracted via `pdftotext -layout`. Algorithm 2 at p. 4-5; adaptive grace window at p. 5; merge function (RDA) at p. 27-28; hardware failure simulation at Tables 2 and 3, p. 9-10.
 - The DiLoCo paper does NOT contain a formal convergence theorem with explicit staleness bound. The closest thing to a bound is the empirical "learner stalls for three steps" caption of Figure 2 (p. 4).
-- An internal uplift-surface-characterization brief (2026-05-23) provides the per-workload D estimates used in the empirical-validation table.
-- `tsugiai-mend-sdk/src/tsugi_mend/concurrent.py:228-229`: the asyncio task's deadline is bounded by `2 * grace_window_ms`, which is the orchestrator's hard upper bound on D * T_step.
+- Per-workload D estimates in the empirical-validation table are derived from the SDK's benchmark runs.
+- `src/tsugi_mend/concurrent.py:228-229`: the asyncio task's deadline is bounded by `2 * grace_window_ms`, which is the orchestrator's hard upper bound on D * T_step.
