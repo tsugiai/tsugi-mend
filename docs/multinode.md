@@ -56,6 +56,18 @@ torchrun --standalone --local-addr=127.0.0.1 \
   --nproc-per-node=2 examples/torchrun_two_rank.py
 ```
 
+The paired benchmark harness has a matching CPU/gloo torchrun path. This runs
+the same cheap cell as the default self-spawn benchmark, but validates the
+env:// launch mode used by real multi-node jobs:
+
+```bash
+torchrun --standalone --local-addr=127.0.0.1 --nproc-per-node=2 \
+  benchmarks/run_paired.py --launch torchrun --cell cpu_gloo_2rank_mlp --no-write
+```
+
+Expected output includes a bit-exact PASS with `max |loss diff| = 0.000e+00`.
+Only rank 0 prints the benchmark summary or writes a result bundle.
+
 Diagnostics for the smoke test are written under
 `./results/torchrun_two_rank/rank*/`.
 
@@ -280,3 +292,38 @@ explicit TCP mappings for the rendezvous port, PyTorch distributed ports, and
 the sideband port range. Pass node-specific `NODE_RANK` and
 `MEND_SIDEBAND_PEERS` through the scheduler rather than hard-coding hostnames in
 the image.
+
+## 7. Real benchmark cell
+
+The benchmark harness also defines `real_8xv100_2node`, a GPU-deferred
+Hugging Face/FSDP cell for maintainer-run hardware validation. It is not a
+laptop or CI target. It requires CUDA, `nccl`, torchrun/env://, and the optional
+real-cell dependencies:
+
+```bash
+python -m pip install -e ".[real-cell]"
+```
+
+The expected launch shape is the same two-node torchrun recipe above, with the
+benchmark driver as the entry point:
+
+```bash
+torchrun \
+  --nnodes="${NNODES}" \
+  --nproc-per-node="${NPROC_PER_NODE}" \
+  --node-rank="${NODE_RANK}" \
+  --rdzv-backend="${RDZV_BACKEND}" \
+  --rdzv-endpoint="${RDZV_ENDPOINT}" \
+  --rdzv-id="${RDZV_ID}" \
+  benchmarks/run_paired.py \
+    --launch torchrun \
+    --cell real_8xv100_2node \
+    --hardware-label "Provider, nodes x GPUs, fabric, pinned CUDA/NCCL/PyTorch"
+```
+
+That cell uses `HuggingFaceTB/SmolLM-135M`, per-node FSDP groups, and a
+deterministic token stream by default. If `--dataset-id` is supplied, the real
+path lazily loads and tokenizes a small deterministic training slice through
+the optional `datasets` dependency. It sets `simulated_merge_delay_ms=0` so the
+measured delay is the real cross-network synchronization cost. The harness will
+fail early on a non-CUDA host instead of falling back to the cheap MLP.

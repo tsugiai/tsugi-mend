@@ -69,34 +69,66 @@ wrote bundle: benchmarks/results/cpu_gloo_2rank_mlp/result.json
 The process exits `0` on a bit-exact PASS and `1` on a FAIL. Pass `--no-write`
 to print the summary without overwriting the committed bundle.
 
+The same cheap cell can also run under `torchrun` through the env:// launch
+path that real multi-node jobs use:
+
+```bash
+torchrun --standalone --local-addr=127.0.0.1 --nproc-per-node=2 \
+  benchmarks/run_paired.py --launch torchrun --cell cpu_gloo_2rank_mlp --no-write
+```
+
+This is still a $0 CPU/gloo run. It validates that each torchrun process acts
+as one benchmark rank, that rank 0 writes the bundle, and that fragment object
+gather uses a dedicated gloo process group rather than the data-plane backend.
+
 ## Cells: cheap-reproducible vs real hardware
 
 | Cell | Backend | Reproducible at | Notes |
 |---|---|---|---|
 | `cpu_gloo_2rank_mlp` | `gloo` (CPU) | **$0, any laptop** | the cheap cell; synthetic MLP, 2 local ranks, injected merge delay |
-| real multi-node cross-rack | `nccl` (GPU) | a real GPU cluster (**out of scope here**) | the harness is READY for it -- see below |
+| `real_8xv100_2node` | `nccl` (GPU) | a real GPU cluster (**out of scope here**) | Hugging Face causal LM, per-node FSDP sharding, deterministic token stream, no simulated merge delay |
 
-### Scaling to a real multi-node config (args only)
+### Real multi-node Hugging Face/FSDP cell
 
-The same driver scales by command-line args; nothing in the measurement code
-changes. For example, a real cell would pass a real backend / rank count /
-hardware label and (in a follow-up that wires a Hugging Face workload) a real
-`model_id` / `tokenizer_id` / `dataset_id`:
+The real cell is implemented but not cheap-reproducible. It requires CUDA, an
+`nccl` data-plane process group, torchrun/env:// launch, and the optional
+real-cell dependencies:
 
 ```bash
-python benchmarks/run_paired.py \
-    --cell real_8xgpu_2node \
-    --backend nccl --ranks 2 \
-    --steps 500 --warmup-steps 50 \
-    --sync-period-steps 128 \
-    --hardware-label "Provider X, 2x 8xGPU, <fabric>, <pinned PyTorch/NCCL/CUDA>"
+pip install -e ".[real-cell]"
 ```
 
-Running a real multi-node cell requires provisioning a GPU cluster and is a
-separate task that is out of scope for this harness. This harness does NOT
-provision compute and does NOT run it. The bundle format already carries the
-hardware / workload / fabric fields the protocol requires, so a real run drops
-into the same `benchmarks/results/<cell>/result.json` shape.
+Example two-node shape, with eight local processes per node:
+
+```bash
+torchrun \
+  --nnodes=2 \
+  --nproc-per-node=8 \
+  --node-rank="${NODE_RANK}" \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+  --rdzv-id=tsugi-mend-real-cell-001 \
+  benchmarks/run_paired.py \
+    --launch torchrun \
+    --cell real_8xv100_2node \
+    --hardware-label "Provider, 2 nodes x 8 GPUs, fabric, pinned CUDA/NCCL/PyTorch"
+```
+
+The real cell loads `HuggingFaceTB/SmolLM-135M` and its tokenizer lazily only
+inside that path, wraps the model in per-node FSDP groups, and exchanges
+same-local-rank shard deltas across nodes through a dedicated gloo object
+gather group. With `dataset_id` unset, the workload uses a deterministic
+synthetic token stream from the tokenizer vocab, so no dataset download is
+required. If `--dataset-id` is supplied, the real path lazily loads a small
+deterministic `train` slice through the optional `datasets` dependency and
+tokenizes that text instead. `simulated_merge_delay_ms` is `0`; real
+cross-network latency is the measured delay.
+
+Running this cell requires provisioning a GPU cluster and is a separate
+maintainer task. This harness does NOT provision compute and does NOT run it.
+The bundle format already carries the hardware / workload / fabric fields the
+protocol requires, so a real run drops into the same
+`benchmarks/results/<cell>/result.json` shape.
 
 ## Result-bundle format (`result.json`)
 
@@ -106,10 +138,11 @@ into the same `benchmarks/results/<cell>/result.json` shape.
   "cell": "<cell name>",
   "reproducible": "cheap" | "real-hardware (requires a GPU cluster)",
   "protocol": "docs/benchmark_protocol.md",
-  "hardware": { "label", "platform", "machine", "python", "torch", "backend", "ranks" },
+  "hardware": { "label", "platform", "machine", "python", "torch", "backend",
+                "ranks", "launch" },
   "workload": { "kind", "model_id", "tokenizer_id", "dataset_id",
-                "batch", "in_dim", "hidden", "out_dim", "tokens_per_step",
-                "optimizer", "lr", "seed" },
+                "batch", "in_dim", "hidden", "out_dim", "sequence_length",
+                "tokens_per_step", "optimizer", "lr", "seed" },
   "sdk_config": { "quorum_min_learners", "grace_window_ms", "sync_period_steps",
                   "apply_lag_steps", "simulated_merge_delay_ms",
                   "outer_step_compression_mode", "concurrent_outer_step",

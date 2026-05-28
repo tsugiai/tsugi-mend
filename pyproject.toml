@@ -26,6 +26,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+real-cell = [
+    "transformers>=4.45",
+    "accelerate>=0.34",
+    "datasets>=2.20",
+]
 benchmark = [
     "transformers>=4.45",
     "accelerate>=0.34",
