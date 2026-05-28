@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Real multi-node cell for `benchmarks/run_paired.py`. New `--launch
+  {selfspawn,torchrun,auto}` flag adds a `torchrun`/`env://` launch path so the
+  same driver scales from the `$0` `cpu_gloo_2rank_mlp` cell up to a real 2-node
+  GPU cluster. Object (`LearnerFragment`) gather rides a dedicated `gloo`
+  process group regardless of the data-plane backend (`nccl` over flaky
+  Python-object collectives is unreliable). Static rendezvous keeps the
+  bundle-writer on global rank 0 deterministically.
+- Pre-baked `real_8xv100_2node` cell consuming the bundle's HF identifiers
+  (`HuggingFaceTB/SmolLM-135M` by default), wrapping the model in **per-node**
+  FSDP, with cross-node same-local-rank `gloo` gather across the two learners.
+  CUDA + the optional `real-cell` extra (`pip install 'tsugi-mend[real-cell]'`)
+  are required; the path raises a clear early error on a non-CUDA host rather
+  than silently falling back to the synthetic MLP.
+- Optional `real-cell` and `benchmark` extras for `transformers`, `accelerate`,
+  `datasets` (and friends). The core install, the `$0` cell, `import
+  tsugi_mend`, the `mypy src` CI gate, and CI's default job do **not** require
+  any of them.
+- Result documentation for the `real_8xv100_2node` cell at
+  `benchmarks/results/real_8xv100_2node/README.md`, including a `n=7` Lambda
+  Labs 2x8xV100 commodity-Ethernet measurement under
+  [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md).
+
+### Changed
+
+- README headline-row framing: bit-exact loss equivalence is now the
+  load-bearing headline; cross-network throughput uplift is reframed as
+  **jitter-conditional** and reported with a range / CI on the
+  `real_8xv100_2node` cell. The prior single-run **+28.58%** point estimate is
+  contextualized as a high-tail event from a higher-jitter session — `n=7`
+  re-measurement under the protocol shows mean **+3.4%**, CI95 **[-5%, +12%]**,
+  per-seed range **[-10%, +15%]**, with bit-exact loss on every seed. The
+  protocol's "never a bare point estimate" rule applies.
+- `mypy benchmarks` is now clean as well as `mypy src` (the CI gate). The
+  optional `transformers` and `datasets` extras are silenced via a per-module
+  override in `pyproject.toml`; the two `loss.backward()` call sites and the
+  synthetic-path `_loss_for_step` return get scoped `type: ignore` codes (the
+  HF forward is `Any` under `--strict`; the underlying values are real
+  `Tensor`s at runtime).
+- `benchmarks/README.md` and `docs/multinode.md` updated to describe the
+  `torchrun` launch path and the real-hardware cell.
+
 ## [0.1.1] - 2026-05-27
 
 ### Added

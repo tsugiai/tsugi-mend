@@ -392,7 +392,10 @@ def _load_dataset_texts(dataset_id: str, sample_count: int = 64) -> list[str]:
 def _loss_for_step(cfg: BenchConfig, state: _TrainingState, step: int) -> torch.Tensor:
     if state.kind == "synthetic-mlp-regression":
         x, target = _batch_for_step(cfg, step)
-        return (state.model(x) - target).pow(2).mean()
+        # state.model is a Union including the HF model whose forward returns Any,
+        # so mypy can't prove the synthetic MLP branch's result is a real Tensor.
+        # It is at runtime (MLP forward returns Tensor; subtraction/pow/mean stay Tensor).
+        return (state.model(x) - target).pow(2).mean()  # type: ignore[no-any-return]
 
     assert state.vocab_size is not None
     torch.manual_seed(cfg.seed + 2000 + step)
@@ -532,7 +535,9 @@ def _run_baseline(
     for step in range(cfg.steps):
         t0 = time.perf_counter()
         loss = _loss_for_step(cfg, state, step)
-        loss.backward()
+        # HF forward (transformers, override-silenced) makes Tensor.backward read as
+        # untyped under --strict; it is a real scalar Tensor at runtime.
+        loss.backward()  # type: ignore[no-untyped-call]
         opt.step()
         opt.zero_grad(set_to_none=True)
         losses.append(loss.item())
@@ -608,7 +613,9 @@ def _run_sdk(
             t0 = time.perf_counter()
             runtime.step_begin(step)
             loss = _loss_for_step(cfg, state, step)
-            loss.backward()
+            # See _run_baseline: HF-forward-derived loss makes Tensor.backward
+            # resolve as an untyped call under --strict.
+            loss.backward()  # type: ignore[no-untyped-call]
             opt.step()
             opt.zero_grad(set_to_none=True)
             losses.append(loss.item())
