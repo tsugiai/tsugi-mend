@@ -9,7 +9,7 @@ Implements the paired-run protocol in ``docs/benchmark_protocol.md``:
 
 For each path the driver:
 
-1. Trains the SAME model on the SAME seed + synthetic data on every rank,
+1. Trains the SAME model on the SAME seed + deterministic data on every rank,
    syncing parameters across ranks every ``sync_period_steps`` inner steps
    through the SDK's Decoupled-DiLoCo ``token_weighted_merge`` reducer.
    - ``baseline``: drives ``GraceWindowSyncer`` synchronously (the training
@@ -32,12 +32,11 @@ The driver then:
 - writes a public-safe result bundle (``result.json``) under
   ``benchmarks/results/<cell>/``.
 
-Scaling: the SAME driver runs the $0 cheap cell (CPU / gloo / tiny MLP) and
-a real multi-node config; only the CLI args change (model, steps, ranks,
-backend, seed, grace window, simulated merge delay). The real multi-node
-run requires provisioning a real GPU cluster and is out of scope here -- the
-harness is ready for it (accepts the config + the bundle shape fits) but does
-not provision compute or run it.
+Scaling: the SAME driver runs the $0 cheap cell (CPU / gloo / tiny MLP), a
+torchrun/env:// launch of that cheap cell, and a GPU-deferred Hugging Face/FSDP
+cell. The real multi-node run requires provisioning a real GPU cluster and is
+out of scope here. The harness implements the config and workload path but does
+not provision compute or run it locally.
 
 Run the cheap cell:
 
@@ -55,7 +54,7 @@ import platform
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -131,8 +130,9 @@ class BenchConfig:
     real multi-node config."""
 
     cell: str = "cpu_gloo_2rank_mlp"
+    launch: str = "selfspawn"           # selfspawn (default), torchrun, or auto
     backend: str = "gloo"               # gloo (CPU) for the cheap cell; nccl for GPU
-    ranks: int = 2                      # learners participating in the merge
+    ranks: int = 2                      # process world size; real FSDP merges per-node shards
     steps: int = 120                    # total inner steps
     warmup_steps: int = 20              # protocol: exclude warmup from steady state
     sync_period_steps: int = 10         # param-sync (outer-round) cadence
@@ -151,6 +151,7 @@ class BenchConfig:
     in_dim: int = 512
     hidden: int = 1024
     out_dim: int = 128
+    sequence_length: int = 128
     lr: float = 0.05
     # Cross-rack merge knobs (apply apples-to-apples to BOTH paths via the
     # SDK's GraceWindowSyncer._finalize). The simulated merge delay is set so
@@ -172,8 +173,120 @@ class BenchConfig:
     _store_path: Optional[str] = field(default=None, repr=False)
 
 
+@dataclass
+class _DistributedRunContext:
+    rank: int
+    world_size: int
+    object_group: Any
+    object_world_size: int
+    learner_id: str
+    local_rank: int = 0
+    local_world_size: int = 1
+    fsdp_group: Any = None
+    groups_to_destroy: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class _TrainingState:
+    model: nn.Module
+    optimizer: torch.optim.Optimizer
+    tokens_per_step: int
+    kind: str
+    device: torch.device
+    vocab_size: Optional[int] = None
+    tokenizer: Any = None
+    dataset_texts: Optional[list[str]] = None
+
+
+def _is_real_cell(cfg: BenchConfig) -> bool:
+    return cfg.model_id is not None
+
+
+def _workload_kind(cfg: BenchConfig) -> str:
+    return "huggingface" if _is_real_cell(cfg) else "synthetic-mlp-regression"
+
+
+def _reproducible_label(cfg: BenchConfig) -> str:
+    if _is_real_cell(cfg) or cfg.backend != "gloo":
+        return "real-hardware (requires a GPU cluster)"
+    return "cheap"
+
+
+def _tokens_per_step(cfg: BenchConfig) -> int:
+    if _is_real_cell(cfg):
+        return cfg.batch * cfg.sequence_length
+    return cfg.batch * cfg.in_dim
+
+
+def _optimizer_label(cfg: BenchConfig) -> str:
+    return "AdamW" if _is_real_cell(cfg) else "SGD"
+
+
+def _quorum_min_learners_for_bundle(cfg: BenchConfig) -> int:
+    if _is_real_cell(cfg) and cfg.launch == "torchrun":
+        local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+        return max(1, cfg.ranks // local_world_size)
+    return cfg.ranks
+
+
+def _torchrun_env_present() -> bool:
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+
+def _resolve_launch(cfg: BenchConfig) -> str:
+    if cfg.launch == "auto":
+        return "torchrun" if _torchrun_env_present() else "selfspawn"
+    if cfg.launch not in {"selfspawn", "torchrun"}:
+        raise ValueError(
+            f"launch must be 'selfspawn', 'torchrun', or 'auto'; got {cfg.launch!r}"
+        )
+    return cfg.launch
+
+
+def _validate_common_config(cfg: BenchConfig) -> None:
+    if cfg.apply_lag_steps >= cfg.sync_period_steps:
+        raise ValueError(
+            f"apply_lag_steps ({cfg.apply_lag_steps}) must be < "
+            f"sync_period_steps ({cfg.sync_period_steps}) so consecutive "
+            f"outer rounds do not overlap"
+        )
+    if cfg.ranks < 1:
+        raise ValueError(f"ranks must be >= 1; got {cfg.ranks}")
+    if cfg.steps <= cfg.warmup_steps:
+        raise ValueError(
+            f"steps ({cfg.steps}) must be greater than warmup_steps "
+            f"({cfg.warmup_steps})"
+        )
+
+
+def _validate_real_cell_requirements(cfg: BenchConfig, launch: str) -> None:
+    if not _is_real_cell(cfg):
+        return
+    missing: list[str] = []
+    if launch != "torchrun":
+        missing.append("--launch torchrun")
+    if cfg.backend != "nccl":
+        missing.append("--backend nccl")
+    if not torch.cuda.is_available():
+        missing.append("CUDA")
+    if missing:
+        missing_text = ", ".join(missing)
+        raise RuntimeError(
+            "real Hugging Face/FSDP cell requires CUDA, --launch torchrun, "
+            "--backend nccl, and the optional tsugi-mend[real-cell] extra; "
+            f"missing or unavailable: {missing_text}"
+        )
+    try:
+        import transformers  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "real Hugging Face/FSDP cell requires the optional "
+            "tsugi-mend[real-cell] extra; install it before running a real cell"
+        ) from exc
+
+
 # ----------------------------------------------------------------------
-# Per-rank paired training (runs in each spawned gloo worker)
+# Per-rank paired training (runs in each spawned or torchrun worker)
 # ----------------------------------------------------------------------
 
 
@@ -195,6 +308,134 @@ def _batch_for_step(cfg: BenchConfig, step: int) -> tuple[torch.Tensor, torch.Te
     return x, target
 
 
+def _make_training_state(cfg: BenchConfig, ctx: _DistributedRunContext) -> _TrainingState:
+    if _is_real_cell(cfg):
+        return _make_hf_training_state(cfg, ctx)
+    model = _make_model(cfg)
+    opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    return _TrainingState(
+        model=model,
+        optimizer=opt,
+        tokens_per_step=_tokens_per_step(cfg),
+        kind="synthetic-mlp-regression",
+        device=torch.device("cpu"),
+    )
+
+
+def _make_hf_training_state(cfg: BenchConfig, ctx: _DistributedRunContext) -> _TrainingState:
+    # Imports stay inside the real-cell path so the default package and the
+    # $0 CPU cell do not require the optional benchmark stack.
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    assert cfg.model_id is not None
+    device = torch.device("cuda", ctx.local_rank)
+    torch.cuda.set_device(device)
+    torch.manual_seed(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
+
+    tokenizer_id = cfg.tokenizer_id or cfg.model_id
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    vocab_size = int(len(tokenizer))
+    if vocab_size <= 1:
+        raise RuntimeError(f"tokenizer {tokenizer_id!r} reports invalid vocab size {vocab_size}")
+    dataset_texts = _load_dataset_texts(cfg.dataset_id) if cfg.dataset_id else None
+
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_id)
+    model.train()
+    model.to(device)
+    wrapped = FSDP(model, process_group=ctx.fsdp_group)
+    opt = torch.optim.AdamW(wrapped.parameters(), lr=cfg.lr)
+    return _TrainingState(
+        model=wrapped,
+        optimizer=opt,
+        tokens_per_step=_tokens_per_step(cfg),
+        kind="huggingface",
+        device=device,
+        vocab_size=vocab_size,
+        tokenizer=tokenizer,
+        dataset_texts=dataset_texts,
+    )
+
+
+def _load_dataset_texts(dataset_id: str, sample_count: int = 64) -> list[str]:
+    # Optional and lazy: only users who set dataset_id need the datasets extra
+    # or a dataset download. The default real cell uses generated token IDs.
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "dataset_id requires the optional datasets dependency; install "
+            "tsugi-mend[real-cell] or omit dataset_id for deterministic token IDs"
+        ) from exc
+
+    dataset = load_dataset(dataset_id, split=f"train[:{sample_count}]")
+    texts: list[str] = []
+    for row in dataset:
+        if isinstance(row, dict):
+            if isinstance(row.get("text"), str):
+                texts.append(row["text"])
+            else:
+                for value in row.values():
+                    if isinstance(value, str):
+                        texts.append(value)
+                        break
+        if len(texts) >= sample_count:
+            break
+    if not texts:
+        raise RuntimeError(f"dataset {dataset_id!r} did not expose a string text column")
+    return texts
+
+
+def _loss_for_step(cfg: BenchConfig, state: _TrainingState, step: int) -> torch.Tensor:
+    if state.kind == "synthetic-mlp-regression":
+        x, target = _batch_for_step(cfg, step)
+        # state.model is a Union including the HF model whose forward returns Any,
+        # so mypy can't prove the synthetic MLP branch's result is a real Tensor.
+        # It is at runtime (MLP forward returns Tensor; subtraction/pow/mean stay Tensor).
+        return (state.model(x) - target).pow(2).mean()  # type: ignore[no-any-return]
+
+    assert state.vocab_size is not None
+    torch.manual_seed(cfg.seed + 2000 + step)
+    torch.cuda.manual_seed_all(cfg.seed + 2000 + step)
+    if state.dataset_texts:
+        assert state.tokenizer is not None
+        texts = [
+            state.dataset_texts[(step * cfg.batch + idx) % len(state.dataset_texts)]
+            for idx in range(cfg.batch)
+        ]
+        encoded = state.tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=cfg.sequence_length,
+        )
+        input_ids = encoded["input_ids"].to(state.device, non_blocking=True)
+        attention_mask = encoded["attention_mask"].to(state.device, non_blocking=True)
+    else:
+        gen = torch.Generator()
+        gen.manual_seed(cfg.seed + 1000 + step)
+        input_ids = torch.randint(
+            low=0,
+            high=state.vocab_size,
+            size=(cfg.batch, cfg.sequence_length),
+            generator=gen,
+            dtype=torch.long,
+        ).to(state.device, non_blocking=True)
+        attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    output = state.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+    )
+    loss: torch.Tensor = output.loss
+    return loss
+
+
 def _snapshot(model: nn.Module) -> list[torch.Tensor]:
     return [p.detach().clone() for p in model.parameters()]
 
@@ -202,13 +443,16 @@ def _snapshot(model: nn.Module) -> list[torch.Tensor]:
 def _build_fragment(
     model: nn.Module,
     prev: list[torch.Tensor],
-    rank: int,
+    learner_id: str,
     round_id: int,
     tokens: int,
 ) -> LearnerFragment:
-    deltas = [cur.detach() - old for cur, old in zip(model.parameters(), prev)]
+    deltas = [
+        (cur.detach() - old.to(device=cur.device, dtype=cur.dtype)).detach().cpu()
+        for cur, old in zip(model.parameters(), prev)
+    ]
     return LearnerFragment(
-        learner_id=f"rank-{rank}",
+        learner_id=learner_id,
         round_id=round_id,
         params_delta=deltas,
         tokens_consumed=tokens,
@@ -228,12 +472,16 @@ def _apply_merged(model: nn.Module, merged: list[torch.Tensor]) -> None:
     """
     with torch.no_grad():
         for p, m in zip(model.parameters(), merged):
-            p.add_(m)
+            p.add_(m.to(device=p.device, dtype=p.dtype))
 
 
-def _gather_fragments(local: LearnerFragment, ranks: int) -> list[LearnerFragment]:
+def _gather_fragments(
+    local: LearnerFragment,
+    ranks: int,
+    object_group: Any,
+) -> list[LearnerFragment]:
     gathered: list[Optional[LearnerFragment]] = [None] * ranks
-    dist.all_gather_object(gathered, local)
+    dist.all_gather_object(gathered, local, group=object_group)
     return [f for f in gathered if f is not None]
 
 
@@ -256,7 +504,10 @@ def _synchronous_merge(
     return result.merged_delta
 
 
-def _run_baseline(cfg: BenchConfig, rank: int) -> tuple[list[float], list[float]]:
+def _run_baseline(
+    cfg: BenchConfig,
+    ctx: _DistributedRunContext,
+) -> tuple[list[float], list[float]]:
     """Vanilla synchronous reducer path. Returns (per-step loss, per-step ms).
 
     At each outer-round step the training thread BLOCKS across the grace
@@ -267,31 +518,33 @@ def _run_baseline(cfg: BenchConfig, rank: int) -> tuple[list[float], list[float]
     difference vs the SDK path is WHEN the delay is paid: here it blocks the
     training thread; in the SDK path it is overlapped off-thread.
     """
-    model = _make_model(cfg)
-    opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    state = _make_training_state(cfg, ctx)
+    model = state.model
+    opt = state.optimizer
     syncer = GraceWindowSyncer(
-        quorum_min_learners=cfg.ranks,
+        quorum_min_learners=ctx.object_world_size,
         grace_window_ms=cfg.grace_window_ms,
         token_weighted=True,
         simulated_merge_delay_ms=cfg.simulated_merge_delay_ms,
     )
-    tokens_per_step = cfg.batch * cfg.in_dim
+    tokens_per_step = state.tokens_per_step
     prev = _snapshot(model)
     losses: list[float] = []
     step_ms: list[float] = []
     pending: Optional[tuple[int, list[torch.Tensor]]] = None  # (apply_at_step, delta)
     for step in range(cfg.steps):
         t0 = time.perf_counter()
-        x, target = _batch_for_step(cfg, step)
-        loss = (model(x) - target).pow(2).mean()
-        loss.backward()
+        loss = _loss_for_step(cfg, state, step)
+        # HF forward (transformers, override-silenced) makes Tensor.backward read as
+        # untyped under --strict; it is a real scalar Tensor at runtime.
+        loss.backward()  # type: ignore[no-untyped-call]
         opt.step()
         opt.zero_grad(set_to_none=True)
         losses.append(loss.item())
 
         if step > 0 and step % cfg.sync_period_steps == 0:
-            local = _build_fragment(model, prev, rank, step, tokens_per_step)
-            fragments = _gather_fragments(local, cfg.ranks)
+            local = _build_fragment(model, prev, ctx.learner_id, step, tokens_per_step)
+            fragments = _gather_fragments(local, ctx.object_world_size, ctx.object_group)
             merged = _synchronous_merge(syncer, fragments, round_id=step)
             pending = (step + cfg.apply_lag_steps, merged)
             prev = _snapshot(model)
@@ -303,9 +556,14 @@ def _run_baseline(cfg: BenchConfig, rank: int) -> tuple[list[float], list[float]
     return losses, step_ms
 
 
-def _fragment_provider_factory(fragments: list[LearnerFragment]) -> FragmentProvider:
+def _distributed_fragment_provider_factory(
+    local: LearnerFragment,
+    ranks: int,
+    object_group: Any,
+) -> FragmentProvider:
     def provider() -> "asyncio.Queue[LearnerFragment]":
         queue: asyncio.Queue[LearnerFragment] = asyncio.Queue()
+        fragments = _gather_fragments(local, ranks, object_group)
         for f in fragments:
             queue.put_nowait(f)
         return queue
@@ -313,7 +571,10 @@ def _fragment_provider_factory(fragments: list[LearnerFragment]) -> FragmentProv
     return provider
 
 
-def _run_sdk(cfg: BenchConfig, rank: int) -> tuple[list[float], list[float]]:
+def _run_sdk(
+    cfg: BenchConfig,
+    ctx: _DistributedRunContext,
+) -> tuple[list[float], list[float]]:
     """mend concurrent outer-step path. Returns (per-step loss, per-step ms).
 
     At each outer-round step the merge is SUBMITTED to the ConcurrentOuterStep
@@ -325,10 +586,11 @@ def _run_sdk(cfg: BenchConfig, rank: int) -> tuple[list[float], list[float]]:
     the SDK absorbs the delay into inner-step compute that the synchronous
     baseline spends blocking.
     """
-    model = _make_model(cfg)
-    opt = torch.optim.SGD(model.parameters(), lr=cfg.lr)
+    state = _make_training_state(cfg, ctx)
+    model = state.model
+    opt = state.optimizer
     config = MendConfig(
-        quorum_min_learners=cfg.ranks,
+        quorum_min_learners=ctx.object_world_size,
         grace_window_ms=cfg.grace_window_ms,
         token_weighted_merge=True,
         sync_period_steps=cfg.sync_period_steps,
@@ -339,8 +601,8 @@ def _run_sdk(cfg: BenchConfig, rank: int) -> tuple[list[float], list[float]]:
         sideband_peers=(),
         diagnostics_dir=None,
     )
-    tokens_per_step = cfg.batch * cfg.in_dim
-    mend_init(model, config, rank_id=f"rank-{rank}")
+    tokens_per_step = state.tokens_per_step
+    mend_init(model, config, rank_id=ctx.learner_id)
     try:
         runtime = get_runtime(model)
         prev = _snapshot(model)
@@ -350,20 +612,24 @@ def _run_sdk(cfg: BenchConfig, rank: int) -> tuple[list[float], list[float]]:
         for step in range(cfg.steps):
             t0 = time.perf_counter()
             runtime.step_begin(step)
-            x, target = _batch_for_step(cfg, step)
-            loss = (model(x) - target).pow(2).mean()
-            loss.backward()
+            loss = _loss_for_step(cfg, state, step)
+            # See _run_baseline: HF-forward-derived loss makes Tensor.backward
+            # resolve as an untyped call under --strict.
+            loss.backward()  # type: ignore[no-untyped-call]
             opt.step()
             opt.zero_grad(set_to_none=True)
             losses.append(loss.item())
             runtime.step_end(step)
 
             if step > 0 and step % cfg.sync_period_steps == 0:
-                local = _build_fragment(model, prev, rank, step, tokens_per_step)
-                fragments = _gather_fragments(local, cfg.ranks)
+                local = _build_fragment(model, prev, ctx.learner_id, step, tokens_per_step)
                 runtime.outer_step_begin(
                     round_id=step,
-                    fragment_provider=_fragment_provider_factory(fragments),
+                    fragment_provider=_distributed_fragment_provider_factory(
+                        local,
+                        ctx.object_world_size,
+                        ctx.object_group,
+                    ),
                 )
                 apply_at = step + cfg.apply_lag_steps
                 prev = _snapshot(model)
@@ -392,6 +658,111 @@ def _collect(runtime: Any, timeout_s: float = 10.0) -> Any:
     raise TimeoutError("outer-step merge did not complete within timeout")
 
 
+def _is_real_group(group: Any) -> bool:
+    return group is not None and group != dist.GroupMember.NON_GROUP_MEMBER
+
+
+def _create_rank_partition_group(
+    partitions: list[list[int]],
+    *,
+    backend: str,
+    rank: int,
+) -> tuple[Any, int, list[Any]]:
+    selected_group = None
+    selected_size = 0
+    owned_groups: list[Any] = []
+    for ranks in partitions:
+        group = dist.new_group(ranks=ranks, backend=backend)
+        if rank in ranks and _is_real_group(group):
+            selected_group = group
+            selected_size = len(ranks)
+            owned_groups.append(group)
+    if selected_group is None:
+        raise RuntimeError(f"rank {rank} did not join any partition group")
+    return selected_group, selected_size, owned_groups
+
+
+def _make_distributed_context(cfg: BenchConfig, rank: int) -> _DistributedRunContext:
+    world_size = dist.get_world_size()
+    if _is_real_cell(cfg):
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", str(rank % local_world_size)))
+        if local_world_size < 1:
+            raise RuntimeError(f"LOCAL_WORLD_SIZE must be positive; got {local_world_size}")
+        if world_size % local_world_size != 0:
+            raise RuntimeError(
+                f"WORLD_SIZE ({world_size}) must be divisible by LOCAL_WORLD_SIZE "
+                f"({local_world_size}) for the per-node FSDP real cell"
+            )
+        node_count = world_size // local_world_size
+        node_rank = rank // local_world_size
+
+        # For FSDP, shard within each node. All ranks create the node groups in
+        # the same order, then each rank keeps the group for its own node.
+        node_partitions = [
+            list(range(node * local_world_size, (node + 1) * local_world_size))
+            for node in range(node_count)
+        ]
+        fsdp_group, _, fsdp_groups = _create_rank_partition_group(
+            node_partitions,
+            backend=cfg.backend,
+            rank=rank,
+        )
+
+        # For LearnerFragment exchange, gather same-local-rank shards across
+        # nodes on a dedicated gloo group. This keeps Python object gather off
+        # NCCL and lines up FSDP shard shapes across learners.
+        shard_partitions = [
+            [node * local_world_size + local for node in range(node_count)]
+            for local in range(local_world_size)
+        ]
+        object_group, object_world_size, object_groups = _create_rank_partition_group(
+            shard_partitions,
+            backend="gloo",
+            rank=rank,
+        )
+        return _DistributedRunContext(
+            rank=rank,
+            world_size=world_size,
+            object_group=object_group,
+            object_world_size=object_world_size,
+            learner_id=f"node-{node_rank}/local-rank-{local_rank}",
+            local_rank=local_rank,
+            local_world_size=local_world_size,
+            fsdp_group=fsdp_group,
+            groups_to_destroy=fsdp_groups + object_groups,
+        )
+
+    object_group = dist.new_group(backend="gloo")
+    return _DistributedRunContext(
+        rank=rank,
+        world_size=world_size,
+        object_group=object_group,
+        object_world_size=world_size,
+        learner_id=f"rank-{rank}",
+        local_rank=int(os.environ.get("LOCAL_RANK", "0")),
+        local_world_size=int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size))),
+        groups_to_destroy=[object_group],
+    )
+
+
+def _destroy_context(ctx: _DistributedRunContext) -> None:
+    for group in reversed(ctx.groups_to_destroy):
+        if _is_real_group(group):
+            dist.destroy_process_group(group)
+
+
+def _run_rank_sequence(
+    cfg: BenchConfig,
+    ctx: _DistributedRunContext,
+) -> tuple[list[float], list[float], list[float], list[float]]:
+    base_losses, base_ms = _run_baseline(cfg, ctx)
+    dist.barrier()
+    sdk_losses, sdk_ms = _run_sdk(cfg, ctx)
+    dist.barrier()
+    return base_losses, base_ms, sdk_losses, sdk_ms
+
+
 def _worker(rank: int, cfg: BenchConfig, return_dict: Any) -> None:
     assert cfg._store_path is not None
     # FileStore is a real public torch.distributed symbol but is not in the
@@ -400,17 +771,16 @@ def _worker(rank: int, cfg: BenchConfig, return_dict: Any) -> None:
     dist.init_process_group(
         backend=cfg.backend, store=store, rank=rank, world_size=cfg.ranks
     )
+    ctx = _make_distributed_context(cfg, rank)
     try:
-        base_losses, base_ms = _run_baseline(cfg, rank)
-        dist.barrier()
-        sdk_losses, sdk_ms = _run_sdk(cfg, rank)
-        dist.barrier()
+        base_losses, base_ms, sdk_losses, sdk_ms = _run_rank_sequence(cfg, ctx)
         if rank == 0:
             return_dict["baseline_losses"] = base_losses
             return_dict["baseline_step_ms"] = base_ms
             return_dict["sdk_losses"] = sdk_losses
             return_dict["sdk_step_ms"] = sdk_ms
     finally:
+        _destroy_context(ctx)
         dist.destroy_process_group()
 
 
@@ -419,44 +789,15 @@ def _worker(rank: int, cfg: BenchConfig, return_dict: Any) -> None:
 # ----------------------------------------------------------------------
 
 
-def run_cell(cfg: BenchConfig) -> dict[str, Any]:
-    """Run the paired benchmark and return the result bundle dict.
-
-    Spawns ``cfg.ranks`` gloo worker processes, collects rank-0's per-step
-    series, verifies bit-exact loss equivalence, summarizes steady-state
-    tokens/s, computes the bootstrap CI, and assembles the public-safe
-    bundle dict (not yet written to disk).
-    """
-    if cfg.apply_lag_steps >= cfg.sync_period_steps:
-        raise ValueError(
-            f"apply_lag_steps ({cfg.apply_lag_steps}) must be < "
-            f"sync_period_steps ({cfg.sync_period_steps}) so consecutive "
-            f"outer rounds do not overlap"
-        )
-    if cfg.ranks < 1:
-        raise ValueError(f"ranks must be >= 1; got {cfg.ranks}")
-    mp.set_start_method("spawn", force=True)
-    manager = mp.Manager()
-    return_dict = manager.dict()
-    with tempfile.TemporaryDirectory(prefix="tsugi_mend_bench_") as tmp:
-        cfg._store_path = os.path.join(tmp, "rendezvous_store")
-        procs = []
-        for rank in range(cfg.ranks):
-            p = mp.Process(target=_worker, args=(rank, cfg, return_dict))
-            p.start()
-            procs.append(p)
-        for p in procs:
-            p.join()
-            if p.exitcode != 0:
-                raise RuntimeError(f"worker exited with code {p.exitcode}")
-
-    base_losses = list(return_dict["baseline_losses"])
-    base_ms = list(return_dict["baseline_step_ms"])
-    sdk_losses = list(return_dict["sdk_losses"])
-    sdk_ms = list(return_dict["sdk_step_ms"])
-
+def _build_result_bundle(
+    cfg: BenchConfig,
+    base_losses: list[float],
+    base_ms: list[float],
+    sdk_losses: list[float],
+    sdk_ms: list[float],
+) -> dict[str, Any]:
     bit_exact = bit_exact_equal(base_losses, sdk_losses)
-    tokens_per_step = cfg.batch * cfg.in_dim
+    tokens_per_step = _tokens_per_step(cfg)
     base_summary = steady_state(base_ms, tokens_per_step, cfg.warmup_steps)
     sdk_summary = steady_state(sdk_ms, tokens_per_step, cfg.warmup_steps)
     ci = bootstrap_uplift_ci(
@@ -469,9 +810,7 @@ def run_cell(cfg: BenchConfig) -> dict[str, Any]:
     return {
         "schema_version": "1.0",
         "cell": cfg.cell,
-        "reproducible": "cheap"
-        if cfg.backend == "gloo"
-        else "real-hardware (requires a GPU cluster)",
+        "reproducible": _reproducible_label(cfg),
         "protocol": "docs/benchmark_protocol.md",
         "hardware": {
             "label": cfg.hardware_label,
@@ -481,11 +820,10 @@ def run_cell(cfg: BenchConfig) -> dict[str, Any]:
             "torch": torch.__version__,
             "backend": cfg.backend,
             "ranks": cfg.ranks,
+            "launch": cfg.launch,
         },
         "workload": {
-            "kind": "synthetic-mlp-regression"
-            if cfg.model_id is None
-            else "huggingface",
+            "kind": _workload_kind(cfg),
             "model_id": cfg.model_id,
             "tokenizer_id": cfg.tokenizer_id,
             "dataset_id": cfg.dataset_id,
@@ -493,13 +831,14 @@ def run_cell(cfg: BenchConfig) -> dict[str, Any]:
             "in_dim": cfg.in_dim,
             "hidden": cfg.hidden,
             "out_dim": cfg.out_dim,
+            "sequence_length": cfg.sequence_length,
             "tokens_per_step": tokens_per_step,
-            "optimizer": "SGD",
+            "optimizer": _optimizer_label(cfg),
             "lr": cfg.lr,
             "seed": cfg.seed,
         },
         "sdk_config": {
-            "quorum_min_learners": cfg.ranks,
+            "quorum_min_learners": _quorum_min_learners_for_bundle(cfg),
             "grace_window_ms": cfg.grace_window_ms,
             "sync_period_steps": cfg.sync_period_steps,
             "apply_lag_steps": cfg.apply_lag_steps,
@@ -549,6 +888,72 @@ def run_cell(cfg: BenchConfig) -> dict[str, Any]:
             },
         },
     }
+
+
+def _run_cell_selfspawn(cfg: BenchConfig) -> dict[str, Any]:
+    mp.set_start_method("spawn", force=True)
+    manager = mp.Manager()
+    return_dict = manager.dict()
+    with tempfile.TemporaryDirectory(prefix="tsugi_mend_bench_") as tmp:
+        cfg._store_path = os.path.join(tmp, "rendezvous_store")
+        procs = []
+        for rank in range(cfg.ranks):
+            p = mp.Process(target=_worker, args=(rank, cfg, return_dict))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+            if p.exitcode != 0:
+                raise RuntimeError(f"worker exited with code {p.exitcode}")
+
+    return _build_result_bundle(
+        cfg,
+        list(return_dict["baseline_losses"]),
+        list(return_dict["baseline_step_ms"]),
+        list(return_dict["sdk_losses"]),
+        list(return_dict["sdk_step_ms"]),
+    )
+
+
+def _run_cell_torchrun(cfg: BenchConfig) -> Optional[dict[str, Any]]:
+    if not _torchrun_env_present():
+        raise RuntimeError(
+            "--launch torchrun requires a torchrun environment with RANK and WORLD_SIZE"
+        )
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    if cfg.ranks != world_size:
+        raise ValueError(
+            f"configured ranks ({cfg.ranks}) must equal torchrun WORLD_SIZE ({world_size})"
+        )
+    if _is_real_cell(cfg):
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    dist.init_process_group(backend=cfg.backend, init_method="env://")
+    ctx = _make_distributed_context(cfg, rank)
+    try:
+        base_losses, base_ms, sdk_losses, sdk_ms = _run_rank_sequence(cfg, ctx)
+        if rank != 0:
+            return None
+        return _build_result_bundle(cfg, base_losses, base_ms, sdk_losses, sdk_ms)
+    finally:
+        _destroy_context(ctx)
+        dist.destroy_process_group()
+
+
+def run_cell(cfg: BenchConfig) -> Optional[dict[str, Any]]:
+    """Run the paired benchmark and return the rank-0 result bundle.
+
+    ``selfspawn`` keeps the original local ``mp.Process`` + ``FileStore`` path
+    as the default. ``torchrun`` assumes this process is already one rank in an
+    env:// launch and returns a bundle only on rank 0.
+    """
+    launch = _resolve_launch(cfg)
+    cfg = replace(cfg, launch=launch)
+    _validate_common_config(cfg)
+    _validate_real_cell_requirements(cfg, launch)
+    if launch == "torchrun":
+        return _run_cell_torchrun(cfg)
+    return _run_cell_selfspawn(cfg)
 
 
 def write_bundle(bundle: dict[str, Any], results_root: Path = RESULTS_ROOT) -> Path:
@@ -606,6 +1011,27 @@ CELLS: dict[str, BenchConfig] = {
         simulated_merge_delay_ms=12,
         hardware_label="local CPU (gloo); $0 cheap reproducible cell",
     ),
+    "real_8xv100_2node": BenchConfig(
+        cell="real_8xv100_2node",
+        launch="torchrun",
+        backend="nccl",
+        ranks=16,
+        steps=500,
+        warmup_steps=50,
+        sync_period_steps=128,
+        apply_lag_steps=8,
+        simulated_merge_delay_ms=0,
+        batch=1,
+        sequence_length=256,
+        lr=1e-5,
+        model_id="HuggingFaceTB/SmolLM-135M",
+        tokenizer_id="HuggingFaceTB/SmolLM-135M",
+        dataset_id=None,
+        hardware_label=(
+            "real GPU cluster placeholder; replace with provider, node count, "
+            "GPU type, fabric, and pinned CUDA/NCCL/PyTorch versions"
+        ),
+    ),
 }
 
 
@@ -616,6 +1042,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
         default="cpu_gloo_2rank_mlp",
         help="named pre-baked cell (overridable by the flags below)",
     )
+    parser.add_argument(
+        "--launch",
+        choices=("selfspawn", "torchrun", "auto"),
+        default=None,
+        help="selfspawn (default cheap cell), torchrun/env://, or auto",
+    )
     parser.add_argument("--backend", default=None, help="gloo (CPU) | nccl (GPU)")
     parser.add_argument("--ranks", type=int, default=None)
     parser.add_argument("--steps", type=int, default=None)
@@ -623,9 +1055,15 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
     parser.add_argument("--sync-period-steps", type=int, default=None)
     parser.add_argument("--apply-lag-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--batch", type=int, default=None)
+    parser.add_argument("--sequence-length", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--grace-window-ms", type=int, default=None)
     parser.add_argument("--simulated-merge-delay-ms", type=int, default=None)
     parser.add_argument("--bootstrap-resamples", type=int, default=None)
+    parser.add_argument("--model-id", default=None)
+    parser.add_argument("--tokenizer-id", default=None)
+    parser.add_argument("--dataset-id", default=None)
     parser.add_argument("--hardware-label", default=None)
     parser.add_argument(
         "--write",
@@ -637,9 +1075,10 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
     )
     args = parser.parse_args(argv)
 
-    cfg = CELLS.get(args.cell, BenchConfig(cell=args.cell))
+    cfg = replace(CELLS[args.cell]) if args.cell in CELLS else BenchConfig(cell=args.cell)
     # CLI overrides (args-only scaling from cheap cell to real config).
     overrides = {
+        "launch": args.launch,
         "backend": args.backend,
         "ranks": args.ranks,
         "steps": args.steps,
@@ -647,9 +1086,15 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
         "sync_period_steps": args.sync_period_steps,
         "apply_lag_steps": args.apply_lag_steps,
         "seed": args.seed,
+        "batch": args.batch,
+        "sequence_length": args.sequence_length,
+        "lr": args.lr,
         "grace_window_ms": args.grace_window_ms,
         "simulated_merge_delay_ms": args.simulated_merge_delay_ms,
         "bootstrap_resamples": args.bootstrap_resamples,
+        "model_id": args.model_id,
+        "tokenizer_id": args.tokenizer_id,
+        "dataset_id": args.dataset_id,
         "hardware_label": args.hardware_label,
     }
     for key, value in overrides.items():
@@ -669,6 +1114,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
     bundle = run_cell(cfg)
+    if bundle is None:
+        return 0
     _print_summary(bundle)
     if write:
         path = write_bundle(bundle)
