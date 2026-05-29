@@ -21,7 +21,9 @@ optimizer, sync cadence) under two synchronization paths and compares them:
 
 Both paths apply the SAME Decoupled-DiLoCo `token_weighted_merge` delta at the
 SAME inner step, so the parameter trajectory -- and therefore the per-step
-loss -- is identical. The driver then:
+loss -- is identical. This bit-exact check is relative to the synchronous
+reducer path in this harness, not to a vanilla DDP/FSDP all-reduce run. The
+driver then:
 
 1. **asserts bit-exact loss equivalence** in the default (lossless) mode --
    the load-bearing invariant. It verifies this (elementwise IEEE-754 equality

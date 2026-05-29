@@ -33,5 +33,8 @@ authentication by default.
 
 Run the sideband listener only on a trusted private network or behind equivalent
 network controls. Do not expose it directly to the public internet or to
-untrusted tenants. Opt-in authentication and TLS support are planned for a
-future release.
+untrusted tenants. Opt-in HMAC authentication and TLS are available in 0.1.x
+through `MendConfig` sideband security fields such as `sideband_psk`,
+`sideband_tls`, `sideband_tls_certfile`, `sideband_tls_keyfile`, and
+`sideband_tls_ca_file`. Secure-by-default sideband authentication is planned for
+0.2.0.

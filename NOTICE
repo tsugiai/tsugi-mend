@@ -21,12 +21,14 @@ Contribution" language.
 
 THIS SDK (tsugi-mend) IS A DELIBERATELY SEPARATE WORK. It does
 not exercise either of TsugiCinema's two patent estates listed
-above. It is an integration of public-art techniques:
+above. It implements public-art reducer and orchestration components,
+plus additional public-art helper components:
 
-  - Decoupled DiLoCo (Douillard et al., arXiv:2604.21428, April 2026)
+  - Decoupled DiLoCo for Resilient Distributed Pre-training
+    (Arthur Douillard et al., arXiv:2604.21428, April 2026)
   - DES-LOC / Local Adam (Iacob et al., arXiv:2505.22549, May 2025)
   - Async Tensor Parallelism (PyTorch / TorchTitan, September 2024)
-  - FALCON fail-slow mitigation (arXiv:2410.12588, October 2024)
+  - FALCON fail-slow detection (arXiv:2410.12588, October 2024)
 
 Because this SDK does not exercise TsugiCinema's K-Pool LoRA or
 Infinity patents, the Apache-2.0 automatic patent grant on this SDK
@@ -50,34 +52,40 @@ This product includes software developed by TsugiCinema, Inc. and is
 licensed under the Apache License, Version 2.0 (see LICENSE).
 
 This software composes public prior art from the following sources.
-Each citation is to the published reference describing the technique
-exercised in this codebase; the implementation here is original
-TsugiCinema, Inc. code that reproduces the published mechanism.
+Each citation is to a published reference relevant to code components
+in this repository. Items 1 and 6 are the reducer/orchestrator paths
+exercised by the current benchmark harness. Items 2 through 5 are
+implemented as standalone components, validators, or integration points
+in 0.1.x and are not all automatically invoked by `mend_init`. The
+implementation here is original TsugiCinema, Inc. code.
 
 1. Cross-rack reducer (GraceWindowSyncer state machine).
-   Decoupled DiLoCo: Continual Pre-Training of Language Models
-   without Aggregator Synchronization.
-   Douillard, A.; Donchev, A.; Rush, A.; Riedel, S. (2026).
+   Decoupled DiLoCo for Resilient Distributed Pre-training.
+   Arthur Douillard; Keith Rush; Yani Donchev; Zachary Charles;
+   Nova Fallen; Ayush Dubey; Ionel Gog; Josef Dean;
+   Blake Woodworth; Zachary Garrett; Nate Keating; Jenny Bishop;
+   Henry Prior; Edouard Yvinec; Arthur Szlam;
+   Marc'Aurelio Ranzato; Jeff Dean (2026).
    arXiv:2604.21428.
 
-2. Desynchronized optimizer momenta (DES-LOC).
+2. Desynchronized optimizer momenta component (DES-LOC).
    DES-LOC: Desynced Low Communication Adaptive Optimizers for
    Training Foundation Models.
    Iacob, A. et al. (2025). arXiv:2505.22549.
 
-3. Async tensor parallelism (intra-node async-TP overlap hooks).
+3. Async tensor parallelism integration component.
    TorchTitan: PyTorch Pre-training Native Library.
    Wanchao Liang, Tianyu Liu, Less Wright, Will Constable,
    Andrew Gu, Chien-Chin Huang, Iris Zhang, Wei Feng,
    Howard Huang, Junjie Wang, Sanket Purandare, Gokul Nadathur,
    Stratos Idreos. PyTorch (2024). https://github.com/pytorch/torchtitan
 
-4. Fail-slow detection (FALCON sliding-window z-score).
+4. Fail-slow detection component (FALCON sliding-window z-score).
    FALCON: Pinpointing and Mitigating Stragglers for Large-Scale
    Hybrid-Parallel Training.
    Wu, T. et al. (2024). arXiv:2410.12588.
 
-5. Optional gradient compression (PowerSGD with error feedback).
+5. Optional gradient compression primitive (PowerSGD with error feedback).
    PowerSGD: Practical Low-Rank Gradient Compression for Distributed
    Optimization.
    Vogels, T.; Karimireddy, S. P.; Jaggi, M. (2019).
@@ -98,11 +106,11 @@ TsugiCinema, Inc. code that reproduces the published mechanism.
    `docs/convergence_equivalence_sketch.md` for the proof sketch.
 
 Patent posture:
-The Apache-2.0 license grants a full automatic patent grant on the
-techniques exercised in this codebase. The mend SDK is patent-
-independent by deliberate construction; it does NOT exercise the
-K-Pool LoRA (US App. 64/060,315) or Infinity (US App. 64/055,093)
-patent estates owned by TsugiCinema, Inc. Those patent estates are
-implemented in the companion patent-aligned SDK at
-github.com/tsugiai/tsugi-kpool and are not present in this
-repository.
+The Apache-2.0 license grants its automatic patent grant under Section
+3 for patent claims necessarily infringed by Contributions in this
+repository. The mend SDK is patent-independent by deliberate
+construction; it does NOT exercise the K-Pool LoRA (US App.
+64/060,315) or Infinity (US App. 64/055,093) patent estates owned by
+TsugiCinema, Inc. Those patent estates are implemented in the
+companion patent-aligned SDK at github.com/tsugiai/tsugi-kpool and are
+not present in this repository.
