@@ -1,7 +1,8 @@
 """Decoupled DiLoCo cross-rack reducer.
 
-Reference: Douillard, Charles, Rush, ..., Jeff Dean, Ranzato (Google
-DeepMind), "Decoupled DiLoCo", arXiv:2604.21428, April 2026.
+Reference: Douillard, Rush, Donchev, Charles, ..., Ranzato, Dean (Google
+DeepMind), "Decoupled DiLoCo for Resilient Distributed Pre-training",
+arXiv:2604.21428, April 2026.
 
 Algorithm summary (Algorithm 2 in the paper, pseudocode form):
 
