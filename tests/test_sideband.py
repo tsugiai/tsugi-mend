@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import warnings
+import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -53,6 +55,60 @@ def _heartbeat_payload(rank_id: str = "rack-peer") -> dict[str, object]:
 
 def _heartbeat_line(rank_id: str = "rack-peer") -> bytes:
     return json.dumps(_heartbeat_payload(rank_id), separators=(",", ":")).encode() + b"\n"
+
+
+def _tls_cert_pair(tmp_path: Path, name: str) -> tuple[str, str]:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is required for local TLS certificate tests")
+
+    cert = tmp_path / f"{name}.crt"
+    key = tmp_path / f"{name}.key"
+    config = tmp_path / f"{name}.cnf"
+    config.write_text(
+        "\n".join(
+            [
+                "[req]",
+                "distinguished_name = req_distinguished_name",
+                "x509_extensions = v3_req",
+                "prompt = no",
+                "[req_distinguished_name]",
+                "CN = localhost",
+                "[v3_req]",
+                "subjectAltName = @alt_names",
+                "[alt_names]",
+                "DNS.1 = localhost",
+                "IP.1 = 127.0.0.1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-sha256",
+            "-days",
+            "1",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-config",
+            str(config),
+            "-extensions",
+            "v3_req",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return str(cert), str(key)
 
 
 async def _send_raw(addr: str, line: bytes) -> None:
@@ -248,6 +304,84 @@ async def test_sideband_rejects_oversized_line_and_keeps_server_alive():
 
 
 @pytest.mark.asyncio
+async def test_sideband_inbound_read_timeout_closes_slow_sender():
+    addr = _free_addr()
+    sb = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr,
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+        inbound_read_timeout_s=0.05,
+    )
+    await sb.start()
+    host, port = Sideband._parse_addr(addr)
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(b'{"rank_id"')
+        await writer.drain()
+
+        assert await asyncio.wait_for(reader.read(), timeout=0.5) == b""
+
+        await _send_raw(addr, _heartbeat_line("valid-peer"))
+        await asyncio.sleep(0.05)
+        assert list(sb.peer_snapshot()) == ["valid-peer"]
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+        await sb.stop()
+
+
+@pytest.mark.asyncio
+async def test_sideband_caps_concurrent_inbound_handlers():
+    addr = _free_addr()
+    sb = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr,
+        peers=(),
+        heartbeat_ms=50,
+        connect_timeout_s=0.5,
+        inbound_read_timeout_s=0.5,
+        max_inbound_connections=1,
+    )
+    await sb.start()
+    host, port = Sideband._parse_addr(addr)
+    _reader, writer = await asyncio.open_connection(host, port)
+    try:
+        writer.write(b'{"rank_id"')
+        await writer.drain()
+        for _ in range(20):
+            if sb._active_inbound_connections == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert sb._active_inbound_connections == 1
+
+        await _send_raw(addr, _heartbeat_line("capped-peer"))
+        await asyncio.sleep(0.05)
+        assert sb.peer_snapshot() == {}
+
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0.05)
+
+        await _send_raw(addr, _heartbeat_line("accepted-peer"))
+        await asyncio.sleep(0.05)
+        assert list(sb.peer_snapshot()) == ["accepted-peer"]
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError):
+            pass
+        await sb.stop()
+
+
+@pytest.mark.asyncio
 async def test_sideband_hmac_accepts_matching_psk():
     addr_sender, addr_receiver = _free_addr_pair()
     sender = Sideband(
@@ -311,6 +445,136 @@ async def test_sideband_hmac_rejects_mismatched_psk():
         await receiver.stop()
 
 
+def test_sideband_hmac_rejects_replayed_signed_frame():
+    sender = Sideband(
+        rank_id="sender",
+        hostname="host-sender",
+        addr="tcp://127.0.0.1:0",
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        psk="shared-secret",
+    )
+    receiver = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr="tcp://127.0.0.1:0",
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        psk="shared-secret",
+    )
+    frame = sender._encode_heartbeat(
+        ProgressHeartbeat(
+            rank_id="sender",
+            hostname="host-sender",
+            step_id=1,
+            vector_clock_us=2,
+            queue_depth=0,
+            health_bit=True,
+        )
+    )
+
+    first = receiver._decode_heartbeat(frame)
+    replay = receiver._decode_heartbeat(frame)
+
+    assert first is not None
+    assert first.rank_id == "sender"
+    assert replay is None
+
+
+def test_sideband_tls_requires_ca_file():
+    with pytest.raises(ValueError, match="tls_ca_file"):
+        Sideband(
+            rank_id="rank-0",
+            hostname="host-a",
+            addr="tcp://127.0.0.1:0",
+            peers=(),
+            heartbeat_ms=50,
+            connect_timeout_s=0.5,
+            tls=True,
+            tls_certfile="server.crt",
+            tls_keyfile="server.key",
+        )
+
+
+@pytest.mark.asyncio
+async def test_sideband_tls_rejects_untrusted_server_cert(tmp_path: Path):
+    trusted_cert, trusted_key = _tls_cert_pair(tmp_path, "trusted")
+    untrusted_cert, untrusted_key = _tls_cert_pair(tmp_path, "untrusted")
+    addr_receiver = _free_addr()
+    receiver = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr_receiver,
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        tls=True,
+        tls_certfile=untrusted_cert,
+        tls_keyfile=untrusted_key,
+        tls_ca_file=untrusted_cert,
+    )
+    sender = Sideband(
+        rank_id="sender",
+        hostname="host-sender",
+        addr=_free_addr(),
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        tls=True,
+        tls_certfile=trusted_cert,
+        tls_keyfile=trusted_key,
+        tls_ca_file=trusted_cert,
+    )
+    await receiver.start()
+    try:
+        await sender._send_to_peer(addr_receiver)
+        await asyncio.sleep(0.05)
+        assert receiver.peer_snapshot() == {}
+    finally:
+        await receiver.stop()
+
+
+@pytest.mark.asyncio
+async def test_sideband_tls_accepts_trusted_server_cert(tmp_path: Path):
+    cert, key = _tls_cert_pair(tmp_path, "trusted")
+    addr_receiver = _free_addr()
+    receiver = Sideband(
+        rank_id="receiver",
+        hostname="host-receiver",
+        addr=addr_receiver,
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        tls=True,
+        tls_certfile=cert,
+        tls_keyfile=key,
+        tls_ca_file=cert,
+    )
+    sender = Sideband(
+        rank_id="sender",
+        hostname="host-sender",
+        addr=_free_addr(),
+        peers=(),
+        heartbeat_ms=20,
+        connect_timeout_s=0.5,
+        tls=True,
+        tls_certfile=cert,
+        tls_keyfile=key,
+        tls_ca_file=cert,
+    )
+    await receiver.start()
+    try:
+        await sender._send_to_peer(addr_receiver)
+        await asyncio.sleep(0.05)
+        snap = receiver.peer_snapshot()
+        assert list(snap) == ["sender"]
+        assert snap["sender"].hostname == "host-sender"
+    finally:
+        await receiver.stop()
+
+
 @pytest.mark.asyncio
 async def test_sideband_peer_allowlist_drops_unknown_rank():
     addr = _free_addr()
@@ -338,9 +602,7 @@ async def test_sideband_peer_allowlist_drops_unknown_rank():
 
 
 @pytest.mark.asyncio
-async def test_sideband_warns_once_for_non_loopback_bind_without_auth():
-    original_warning_state = Sideband._insecure_bind_warning_emitted
-    Sideband._insecure_bind_warning_emitted = False
+async def test_sideband_warns_for_each_non_loopback_bind_without_auth():
     first = Sideband(
         rank_id="rank-0",
         hostname="host-a",
@@ -362,12 +624,9 @@ async def test_sideband_warns_once_for_non_loopback_bind_without_auth():
             await first.start()
         await first.stop()
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with pytest.warns(RuntimeWarning, match="non-loopback"):
             await second.start()
-        assert caught == []
         await second.stop()
     finally:
         await first.stop()
         await second.stop()
-        Sideband._insecure_bind_warning_emitted = original_warning_state

@@ -71,3 +71,19 @@ def test_sideband_addr_validation():
 def test_sideband_heartbeat_positive():
     with pytest.raises(ValueError, match="sideband_heartbeat_ms"):
         MendConfig(sideband_heartbeat_ms=0)
+
+
+def test_sideband_inbound_limits_validation():
+    with pytest.raises(ValueError, match="sideband_inbound_read_timeout_s"):
+        MendConfig(sideband_inbound_read_timeout_s=0)
+    with pytest.raises(ValueError, match="sideband_max_inbound_connections"):
+        MendConfig(sideband_max_inbound_connections=0)
+
+
+def test_sideband_tls_requires_ca_file():
+    with pytest.raises(ValueError, match="sideband_tls_ca_file"):
+        MendConfig(
+            sideband_tls=True,
+            sideband_tls_certfile="server.crt",
+            sideband_tls_keyfile="server.key",
+        )

@@ -83,6 +83,8 @@ class _MaxRuntime:
                 tls_ca_file=config.sideband_tls_ca_file,
                 peer_allowlist=config.sideband_peer_allowlist,
                 max_line_bytes=config.sideband_max_line_bytes,
+                inbound_read_timeout_s=config.sideband_inbound_read_timeout_s,
+                max_inbound_connections=config.sideband_max_inbound_connections,
             )
         self.diagnostics = DiagnosticsWriter(config.diagnostics_dir)
         self.topology: Optional[Topology] = None
