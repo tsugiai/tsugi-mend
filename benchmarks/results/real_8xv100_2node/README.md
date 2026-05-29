@@ -16,9 +16,11 @@ paired-bootstrap 95% CI per run plus the cross-seed CI across `n` seeds.
 
 - **Cell config** (`benchmarks/run_paired.py` `CELLS["real_8xv100_2node"]`):
   backend `nccl`, launch `torchrun`, ranks 16, steps 500, warmup 50,
-  sync_period_steps 128, apply_lag_steps 4, simulated_merge_delay_ms 0,
-  model_id `HuggingFaceTB/SmolLM-135M`, batch 8, seq_len 512.
-- **Reproduction (one paired run)** — launch the harness across the cluster
+  sync_period_steps 128, apply_lag_steps 8, simulated_merge_delay_ms 0,
+  model_id `HuggingFaceTB/SmolLM-135M`, tokenizer_id
+  `HuggingFaceTB/SmolLM-135M`, dataset_id unset, batch 1, sequence_length
+  256, lr 1e-5.
+- **Reproduction (one paired run)** - launch the harness across the cluster
   with the brief in [`docs/multinode.md`](../../../docs/multinode.md):
 
   ```bash
@@ -26,6 +28,11 @@ paired-bootstrap 95% CI per run plus the cross-seed CI across `n` seeds.
     --master-addr=<node0-priv-ip> --master-port=29500 \
     benchmarks/run_paired.py --launch torchrun --cell real_8xv100_2node \
     --backend nccl --ranks 16 --steps 500 --warmup-steps 50 --seed <s> \
+    --sync-period-steps 128 --apply-lag-steps 8 \
+    --grace-window-ms 0 --simulated-merge-delay-ms 0 \
+    --batch 1 --sequence-length 256 --lr 1e-5 \
+    --model-id HuggingFaceTB/SmolLM-135M \
+    --tokenizer-id HuggingFaceTB/SmolLM-135M \
     --hardware-label "<provider>, 2x 8xV100 (16GB), commodity Ethernet"
   ```
 
@@ -34,7 +41,7 @@ paired-bootstrap 95% CI per run plus the cross-seed CI across `n` seeds.
 
 ## Measurement (n=7, Lambda Labs us-south-2, commodity Ethernet)
 
-`n=7` paired seeds. Each run: 500 paired steps, sync_period 128, apply_lag 4,
+`n=7` paired seeds. Each run: 500 paired steps, sync_period 128, apply_lag 8,
 warmup 50. Per-run CIs are paired-bootstrap (10000 resamples) over the
 steady-state paired step times.
 
@@ -62,9 +69,12 @@ steady-state paired step times.
 
 ## How to read these numbers honestly
 
-- **Bit-exact loss equivalence is the robust headline.** The SDK's default mode
-  preserves per-step loss to IEEE-754 equality across every paired run, every
-  seed, every fabric condition we've measured. This is what the SDK guarantees.
+- **Bit-exact loss equivalence is the robust headline.** The SDK concurrent
+  path preserves per-step loss to IEEE-754 equality against the
+  synchronous-reducer path across every paired run and seed in this bundle.
+  Both paths use the same local-step plus periodic-merge construction and apply
+  the same merged delta at the same lag; this is not a vanilla DDP/FSDP
+  all-reduce equivalence claim.
 - **Throughput uplift on real cross-network is jitter-conditional.** The SDK's
   overlap mechanisms (Decoupled-DiLoCo sync at sync_period boundaries plus the
   grace-window aggregator and sideband control plane) deliver speedup *only when

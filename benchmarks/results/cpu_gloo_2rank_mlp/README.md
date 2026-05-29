@@ -51,9 +51,10 @@ the merge delay is **blocked on** (baseline) or **overlapped** (SDK).
 - **The tokens/s uplift point estimate is noisy on a CPU.** It is a real
   measurement of the overlap mechanism, but absolute CPU step times vary with
   OS scheduling, so the committed number is one observed run, not a stable
-  population mean. Across repeated local runs the point estimate moved within
-  roughly the +15% to +30% range with a 95% CI that stayed above zero. Report
-  it with its CI, never as a bare point estimate.
+  population mean. The committed `result.json` records +14.52% with CI95
+  [+3.41%, +25.26%]. Re-runs may move within that band or outside it on a
+  different CPU, OS scheduler state, or torch build. Report the CPU number with
+  its CI, never as a bare point estimate.
 - **This is a NEW cheap result, not a restatement of any headline number.**
   It is a synthetic MLP on CPU under an injected merge delay. It demonstrates
   that the overlap mechanism produces a measurable, bit-exact-preserving

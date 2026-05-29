@@ -10,6 +10,16 @@ This document is the reproduction contract for any tsugi-mend measurement that e
 
 Tokens per second, observed at rank 0, averaged over the steady-state portion of the run (excluding warmup steps 0-50). Sample n = step count - warmup.
 
+## Bit-exact referent
+
+When a tsugi-mend artifact reports bit-exact loss equivalence, the referent is
+the benchmark's synchronous-reducer path. In the current harness, both
+`baseline` and `sdk` use the same Decoupled-DiLoCo-style local-step plus
+periodic-merge construction and apply the same merged delta at the same
+`apply_lag_steps` offset. The bit-exact check proves that moving the merge wait
+onto the concurrent outer-step path does not change numerics. It is not a claim
+that either path is numerically equal to a vanilla DDP/FSDP all-reduce run.
+
 ## Secondary measurements (always report)
 
 - p50, p95, p99 step time in milliseconds (rank 0, steady state).
@@ -57,7 +67,11 @@ Dump `MendConfig` as JSON at `mend_init` time into the diagnostics file (this ha
 
 Pre-registered expectations for cross-rack software-only distributed training:
 
-| Stage | Expected delta vs vanilla DDP / FSDP | Interpretation |
+Each artifact must name its baseline. The current public harness uses the
+synchronous-reducer path as its paired baseline; a vanilla DDP/FSDP comparison
+must be labeled separately if a future artifact runs one.
+
+| Stage | Expected throughput delta vs the named synchronous baseline | Interpretation |
 |---|---|---|
 | C (intra-node simulated two-rack) | -5% to +5% | NO uplift expected; checking for non-regression |
 | D (2x A100 cross-Ethernet) | +5% to +15% | First realistic cross-rack measurement |

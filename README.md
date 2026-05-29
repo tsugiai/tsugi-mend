@@ -5,19 +5,28 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![CI](https://github.com/tsugiai/tsugi-mend/actions/workflows/ci.yml/badge.svg)](https://github.com/tsugiai/tsugi-mend/actions/workflows/ci.yml)
 
-Maximum-uplift cross-rack distributed-training reducer for PyTorch.
+Cross-rack reducer toolkit for PyTorch training loops.
 
-A software-only drop-in that replaces the cross-rack data-parallel
-all-reduce with an integration of public-art techniques designed to
-maximize measured tokens-per-second uplift on realistic cross-rack
-topology:
+`tsugi-mend` is a software-only component toolkit for wiring
+Decoupled-DiLoCo-style periodic merges and concurrent outer-step overlap into
+a training loop. It is not a transparent 0.1.x drop-in that intercepts DDP or
+FSDP collectives by itself. The caller drives the integration points at
+outer-step boundaries, supplies parameter-delta fragments, collects merged
+deltas, and applies them at the same lag as the synchronous-reducer path. The
+examples and benchmark driver are the worked integrations.
 
-- **Decoupled DiLoCo** (Douillard et al., arXiv:2604.21428, April 2026): independent asynchronous learners, minimum quorum, adaptive grace window, token-weighted merge.
-- **DES-LOC / Local Adam** (Iacob et al., arXiv:2505.22549, May 2025; ICLR 2026): desynchronized synchronization periods for adaptive-optimizer momenta.
-- **Async tensor parallelism** (PyTorch / TorchTitan, September 2024): intra-node overlap of all-gather / reduce-scatter with matmul.
-- **FALCON fail-slow mitigation** (arXiv:2410.12588, October 2024): sliding-window z-score detection of slow nodes to exclude them from the current quorum round.
+Public-art references and 0.1.x implementation status:
 
-The SDK keeps intra-rack TP / CP / PP / FSDP collectives unchanged (vanilla NCCL inside the NVLink domain) and replaces only the off-rack DP boundary with the four-paper stack above.
+- **Decoupled DiLoCo for Resilient Distributed Pre-training** (Arthur Douillard et al., arXiv:2604.21428, April 2026): the reducer implements minimum quorum, adaptive grace window, and token-weighted merge.
+- **Concurrent outer-step overlap**: the `ConcurrentOuterStep` orchestrator is wired when `concurrent_outer_step=True`, so the training thread can overlap the grace-window wait with inner-step compute.
+- **DES-LOC / Local Adam** (Iacob et al., arXiv:2505.22549, May 2025; ICLR 2026): desynchronized synchronization-period components are present, but moment synchronization is not automatically wired into `mend_init` in 0.1.x.
+- **Async tensor parallelism** (PyTorch / TorchTitan, September 2024): treated as an integration component/configuration point, not automatically installed by `mend_init` in 0.1.x.
+- **FALCON fail-slow detection** (arXiv:2410.12588, October 2024): the runtime observes step times and can emit detection diagnostics; FALCON-style quorum exclusion/mitigation is not wired in 0.1.x.
+- **Gradient compression** (`none`, `int8`, `powersgd`): primitives and config validation are present; the default path is lossless `none`, and compression is not invoked by the 0.1.x runtime outer-step path.
+
+The SDK keeps intra-rack TP / CP / PP / FSDP collectives unchanged. In 0.1.x,
+the public runtime exercises the reducer plus concurrent outer-step overlap;
+the other mechanisms above are components or integration points.
 
 ## Install
 
@@ -56,8 +65,9 @@ available and flag single-seed (n=1) cells explicitly.
 
 ### Production-grounded results
 
-The robust headline is **bit-exact loss equivalence in default mode** — preserved
-across every paired run, every seed, every fabric condition we have measured.
+The robust headline is **bit-exact loss equivalence in default mode**. It is
+preserved across every paired run, every seed, every fabric condition we have
+measured.
 Throughput uplift on real cross-network is **jitter-conditional**: the SDK's
 overlap mechanisms hide cross-rack latency when it exists, so the magnitude of
 the uplift depends on the fabric jitter present at measurement time.
@@ -67,13 +77,15 @@ the uplift depends on the fabric jitter present at measurement time.
 | **Real cross-network 2-node 8xV100 (synchronous reducer)** | Lambda Labs commodity Ethernet, SmolLM-135M, 500 paired steps × 7 seeds | **Bit-exact loss PASS on every seed** (max\|loss diff\| = 0.0); uplift **mean +3.4%, CI95 [-5%, +12%]**, per-seed range **[-10%, +15%]** (n=7). Details: [`benchmarks/results/real_8xv100_2node/`](benchmarks/results/real_8xv100_2node/) |
 | Production-realistic multi-GPU FSDP + 7B model (realistic floor, 3-seed CI) | Modal 8xH100 FSDP FULL_SHARD, Qwen-2.5-7B + simulated 2-rack, 4 delays × 3 seeds | +6.37% ± 1.31% at 2000ms (n=3) |
 | H100 Hopper single-instance (synchronous reducer baseline) | Modal 8x H100 SXM5, Llama-3-8B, 2000 paired steps × 3 seeds | -0.97% ± 1.5% (predicted null; Hopper NVLink absorbs the synchronous-path cross-rack tax) |
-| Real cross-network 2-pod 8xH100 (production-fabric floor; n=1) | RunPod 2x 8x H100 SXM5 over real InfiniBand / RoCE v2 3.2 Tbps, Llama-3-8B, 500 paired steps × 1 seed | +1.42% tps + 0.18% loss delta (effectively bit-exact); **n=1 caveat is load-bearing** (same order of magnitude as baseline-only seed variance); n=3 CI pending |
 
 How to read the production-grounded numbers honestly:
 
 - **Bit-exact loss equivalence is the load-bearing result.** Every cross-network
   paired run preserves loss to IEEE-754 equality vs the synchronous-reducer
-  baseline. This is what the SDK guarantees in default mode.
+  baseline: both paths apply the same Decoupled-DiLoCo-style merged delta at
+  the same lag, and the concurrent path only moves the merge wait off the
+  training thread. This is not a claim that either path is numerically equal to
+  a vanilla DDP/FSDP all-reduce run.
 - **Throughput uplift on real cross-network is jitter-conditional, not a fixed
   magnitude.** On the 2-node 8xV100 commodity-Ethernet cell, `n=7` re-measurement
   under [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md) shows mean
@@ -89,8 +101,12 @@ How to read the production-grounded numbers honestly:
 - Production-realistic multi-GPU FSDP yields a smaller honest floor (**+6.37%
   ± 1.31%, n=3**) at injected 2000ms delay because 8-rank NCCL pipelining
   absorbs some of the simulated delay.
-- The real-fabric Hopper 2-pod InfiniBand / RoCE result remains a point estimate:
-  **n=1 caveat is load-bearing** and the n=3 CI is pending.
+- **Protocol-incomplete single-seed note.** The real-fabric Hopper 2-pod
+  InfiniBand / RoCE result is not comparable to the n>=3 rows above yet:
+  RunPod 2x 8x H100 SXM5 over real InfiniBand / RoCE v2 3.2 Tbps, Llama-3-8B,
+  500 paired steps × 1 seed, measured +1.42% tps with +0.18% loss delta. The
+  **n=1 caveat is load-bearing** because the point estimate is the same order
+  of magnitude as baseline-only seed variance; n=3 CI is pending.
 
 ### Ceiling-case / simulated-delay results
 
@@ -127,30 +143,45 @@ See [`docs/multinode.md`](docs/multinode.md) for the multi-node launch walkthrou
 
 ```python
 from tsugi_mend import MendConfig, mend_init, mend_shutdown
+from tsugi_mend.runtime import get_runtime
 
 config = MendConfig(
     quorum_min_learners=4,
     grace_window_ms=2000,
     token_weighted_merge=True,
     sync_period_steps=128,
-    momentum_sync_period_steps=512,
-    async_tp_enabled=True,
     # Orchestrator overlaps the cross-rack outer-step wait with inner-step
-    # async-TP compute. Default True.
+    # compute. Default True.
     concurrent_outer_step=True,
-    failslow_zscore_threshold=3.0,
-    failslow_window_steps=50,
-    rack_aware=True,
-    sideband_addr="tcp://0.0.0.0:51900",
-    sideband_peers=("tcp://peer1:51900", "tcp://peer2:51900"),
-    sideband_heartbeat_ms=100,
     diagnostics_dir="./results/mend_diag",
 )
 
 mend_init(model, config)
-# ... train normally ...
+runtime = get_runtime(model)
+
+for step, batch in enumerate(loader):
+    runtime.step_begin(step)
+    loss = train_one_step(model, optimizer, batch)
+
+    sched = runtime.schedule_for(step)
+    if sched.should_sync_params and not runtime.outer_step_in_flight():
+        runtime.outer_step_begin(
+            round_id=step,
+            fragment_provider=make_fragment_provider(...),
+        )
+
+    result = runtime.outer_step_collect()
+    if result is not None:
+        apply_merged_delta(model, result.merged_delta)
+
+    runtime.step_end(step)
+
 mend_shutdown(model)
 ```
+
+The snippet above is the integration shape, not a complete program. Use the
+examples below for runnable wiring, and the benchmark driver for the fuller
+fragment gather and merge-application path.
 
 Two runnable, CPU-only integration examples (no GPU or multi-node required):
 
