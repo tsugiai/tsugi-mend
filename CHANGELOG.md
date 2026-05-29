@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-29
+
 ### Added
 
 - Real multi-node cell for `benchmarks/run_paired.py`. New `--launch
@@ -30,6 +32,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `benchmarks/results/real_8xv100_2node/README.md`, including a `n=7` Lambda
   Labs 2x8xV100 commodity-Ethernet measurement under
   [`docs/benchmark_protocol.md`](docs/benchmark_protocol.md).
+- Bounded process-group timeouts in the benchmark harness and the torchrun
+  example. An explicit `timeout=` is now passed to every `init_process_group`
+  / `new_group` site (`BenchConfig.process_group_timeout_s`, default 180s;
+  `--process-group-timeout-s`; `MEND_PROCESS_GROUP_TIMEOUT_S` in the example).
+  A peer failure now raises a bounded backend error instead of an indefinite
+  hang; happy-path numerics are unchanged.
+- Multi-node runbook completion in `docs/multinode.md`: a "Failure contract and
+  timeout" section, a "Multi-NIC interface selection" subsection
+  (`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`, `ip -br addr` discovery, the
+  wrong-interface failure mode), and filled example addresses.
 
 ### Changed
 
@@ -49,6 +61,36 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `Tensor`s at runtime).
 - `benchmarks/README.md` and `docs/multinode.md` updated to describe the
   `torchrun` launch path and the real-hardware cell.
+- Documentation now describes `tsugi-mend` honestly as a component toolkit
+  rather than a transparent drop-in. `mend_init` wires the reducer plus the
+  concurrent outer-step orchestrator; async-TP, DES-LOC moment synchronization,
+  FALCON mitigation, and gradient compression are present as components or
+  integration points and are not automatically invoked by `mend_init` in 0.1.x.
+  The README quickstart now shows the real outer-step integration loop.
+- NOTICE attribution scoped to what the runtime actually exercises; the
+  Decoupled DiLoCo citation corrected to the published arXiv:2604.21428 title
+  and author list and made consistent across `README.md`, `NOTICE`, and
+  `reducer.py`.
+- `real_8xv100_2node` result README reconciled to the committed cell config
+  (`apply_lag_steps` 8, batch 1, `sequence_length` 256, lr 1e-5) with every
+  reproduction flag pinned; the single-seed `n=1` production-floor row moved out
+  of the comparative table into a labeled protocol-incomplete note; the cpu-cell
+  prose aligned to the committed CI; `docs/benchmark_protocol.md` now states the
+  bit-exact referent (the SDK overlap path equals the synchronous-reducer path,
+  not a vanilla DDP/FSDP all-reduce).
+- `SECURITY.md` updated to note that opt-in HMAC and TLS are available in 0.1.x
+  (secure-by-default is planned for 0.2.0).
+
+### Security
+
+- Sideband opt-in controls hardened (control-plane only; the default
+  trusted-network behavior is unchanged). HMAC frames are now replay-protected
+  via a bounded per-rank monotonic nonce floor. TLS requires a CA file and
+  verifies peer identity (`check_hostname` plus `CERT_REQUIRED`) instead of
+  silently accepting any certificate. Inbound connections enforce a read timeout
+  and a concurrent-connection cap (slow-reader / socket-exhaustion mitigation).
+  The insecure non-loopback bind warning now fires per bind instead of once per
+  process.
 
 ## [0.1.1] - 2026-05-27
 
