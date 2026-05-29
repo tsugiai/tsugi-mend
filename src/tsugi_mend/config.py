@@ -14,7 +14,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from tsugi_mend.sideband import DEFAULT_SIDEBAND_MAX_LINE_BYTES
+from tsugi_mend.sideband import (
+    DEFAULT_SIDEBAND_INBOUND_READ_TIMEOUT_S,
+    DEFAULT_SIDEBAND_MAX_INBOUND_CONNECTIONS,
+    DEFAULT_SIDEBAND_MAX_LINE_BYTES,
+)
 
 
 @dataclass
@@ -195,6 +199,10 @@ class MendConfig:
     sideband_psk: Optional[str] = None
     sideband_peer_allowlist: Optional[tuple[str, ...]] = None
     sideband_max_line_bytes: int = DEFAULT_SIDEBAND_MAX_LINE_BYTES
+    # Bound incomplete or slow inbound control-plane frames.
+    sideband_inbound_read_timeout_s: float = DEFAULT_SIDEBAND_INBOUND_READ_TIMEOUT_S
+    # Cap concurrent inbound handler work to limit socket-exhaustion pressure.
+    sideband_max_inbound_connections: int = DEFAULT_SIDEBAND_MAX_INBOUND_CONNECTIONS
     sideband_tls: bool = False
     sideband_tls_certfile: Optional[str] = None
     sideband_tls_keyfile: Optional[str] = None
@@ -268,12 +276,23 @@ class MendConfig:
             raise ValueError(
                 f"sideband_max_line_bytes must be >= 1; got {self.sideband_max_line_bytes}"
             )
+        if self.sideband_inbound_read_timeout_s <= 0:
+            raise ValueError(
+                "sideband_inbound_read_timeout_s must be > 0; "
+                f"got {self.sideband_inbound_read_timeout_s}"
+            )
+        if self.sideband_max_inbound_connections < 1:
+            raise ValueError(
+                "sideband_max_inbound_connections must be >= 1; "
+                f"got {self.sideband_max_inbound_connections}"
+            )
         if self.sideband_tls and (
             self.sideband_tls_certfile is None or self.sideband_tls_keyfile is None
+            or self.sideband_tls_ca_file is None
         ):
             raise ValueError(
                 "sideband_tls=True requires sideband_tls_certfile and "
-                "sideband_tls_keyfile"
+                "sideband_tls_keyfile and sideband_tls_ca_file"
             )
         if self.simulated_merge_delay_distribution not in (
             "constant", "bimodal", "long_tail",

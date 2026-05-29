@@ -35,11 +35,15 @@ import json
 import ssl
 import time
 import warnings
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from typing import ClassVar, Optional, TypeGuard, cast
+from typing import Optional, TypeGuard, cast
 
 
 DEFAULT_SIDEBAND_MAX_LINE_BYTES = 4096
+DEFAULT_SIDEBAND_INBOUND_READ_TIMEOUT_S = 1.0
+DEFAULT_SIDEBAND_MAX_INBOUND_CONNECTIONS = 64
+DEFAULT_SIDEBAND_REPLAY_CACHE_PEERS = 1024
 _MAX_HEARTBEAT_INT = 2**63 - 1
 _MAX_HEARTBEAT_TEXT_BYTES = 1024
 _HEARTBEAT_FIELDS = frozenset(
@@ -96,8 +100,6 @@ class Sideband:
     (default 100 ms).
     """
 
-    _insecure_bind_warning_emitted: ClassVar[bool] = False
-
     def __init__(
         self,
         rank_id: str,
@@ -114,13 +116,27 @@ class Sideband:
         tls_ca_file: Optional[str] = None,
         peer_allowlist: Optional[tuple[str, ...]] = None,
         max_line_bytes: int = DEFAULT_SIDEBAND_MAX_LINE_BYTES,
+        inbound_read_timeout_s: float = DEFAULT_SIDEBAND_INBOUND_READ_TIMEOUT_S,
+        max_inbound_connections: int = DEFAULT_SIDEBAND_MAX_INBOUND_CONNECTIONS,
     ) -> None:
         if psk == "":
             raise ValueError("psk must be non-empty when configured")
         if max_line_bytes < 1:
             raise ValueError(f"max_line_bytes must be >= 1; got {max_line_bytes}")
-        if tls and (tls_certfile is None or tls_keyfile is None):
-            raise ValueError("tls=True requires tls_certfile and tls_keyfile")
+        if inbound_read_timeout_s <= 0:
+            raise ValueError(
+                f"inbound_read_timeout_s must be > 0; got {inbound_read_timeout_s}"
+            )
+        if max_inbound_connections < 1:
+            raise ValueError(
+                f"max_inbound_connections must be >= 1; got {max_inbound_connections}"
+            )
+        if tls and (
+            tls_certfile is None or tls_keyfile is None or tls_ca_file is None
+        ):
+            raise ValueError(
+                "tls=True requires tls_certfile, tls_keyfile, and tls_ca_file"
+            )
 
         self.rank_id = rank_id
         self.hostname = hostname
@@ -129,6 +145,8 @@ class Sideband:
         self.heartbeat_ms = heartbeat_ms
         self.connect_timeout_s = connect_timeout_s
         self.max_line_bytes = max_line_bytes
+        self.inbound_read_timeout_s = inbound_read_timeout_s
+        self.max_inbound_connections = max_inbound_connections
 
         self._psk: Optional[bytes] = psk.encode("utf-8") if psk is not None else None
         self._tls = tls
@@ -145,6 +163,8 @@ class Sideband:
 
         self._peer_state: dict[str, ProgressHeartbeat] = {}
         self._peer_last_recv_us: dict[str, int] = {}
+        self._last_nonce_by_rank: OrderedDict[str, int] = OrderedDict()
+        self._active_inbound_connections = 0
 
         self._running = False
         self._tasks: list[asyncio.Task[None]] = []
@@ -279,25 +299,34 @@ class Sideband:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        if self._active_inbound_connections >= self.max_inbound_connections:
+            await self._close_writer(writer)
+            return
+        self._active_inbound_connections += 1
+        try:
+            await self._read_inbound_heartbeat(reader)
+        finally:
+            self._active_inbound_connections -= 1
+            await self._close_writer(writer)
+
+    async def _read_inbound_heartbeat(self, reader: asyncio.StreamReader) -> None:
         now_us = time.monotonic_ns() // 1000
         try:
-            line = await reader.readline()
-        except (OSError, ConnectionError, ValueError):
-            writer.close()
+            line = await asyncio.wait_for(
+                reader.readline(),
+                timeout=self.inbound_read_timeout_s,
+            )
+        except (OSError, ConnectionError, ValueError, asyncio.TimeoutError):
             return
         if not line:
-            writer.close()
             return
         if len(line) > self.max_line_bytes:
-            writer.close()
             return
         hb = self._decode_heartbeat(line)
         if hb is None:
-            writer.close()
             return
         self._peer_state[hb.rank_id] = hb
         self._peer_last_recv_us[hb.rank_id] = now_us
-        writer.close()
 
     def _encode_heartbeat(self, msg: ProgressHeartbeat) -> bytes:
         payload: dict[str, object] = asdict(msg)
@@ -320,17 +349,24 @@ class Sideband:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
 
-        payload: object
         if self._psk is None:
-            payload = raw
-        else:
-            signed_payload = self._verify_signed_payload(raw)
-            if signed_payload is None:
-                return None
-            payload = signed_payload
-        return self._heartbeat_from_payload(payload)
+            return self._heartbeat_from_payload(raw)
 
-    def _verify_signed_payload(self, raw: object) -> Optional[dict[str, object]]:
+        signed_payload = self._verify_signed_payload(raw)
+        if signed_payload is None:
+            return None
+        payload, nonce = signed_payload
+        hb = self._heartbeat_from_payload(payload)
+        if hb is None:
+            return None
+        if not self._accept_signed_nonce(hb.rank_id, nonce):
+            return None
+        return hb
+
+    def _verify_signed_payload(
+        self,
+        raw: object,
+    ) -> Optional[tuple[dict[str, object], int]]:
         if self._psk is None:
             return None
         if not isinstance(raw, dict):
@@ -356,7 +392,26 @@ class Sideband:
         expected_hmac = self._hmac_hex(body)
         if not hmac.compare_digest(received_hmac, expected_hmac):
             return None
-        return cast(dict[str, object], payload)
+        return cast(dict[str, object], payload), nonce
+
+    def _accept_signed_nonce(self, rank_id: str, nonce: int) -> bool:
+        previous = self._last_nonce_by_rank.get(rank_id)
+        if previous is not None and nonce <= previous:
+            return False
+
+        self._last_nonce_by_rank[rank_id] = nonce
+        self._last_nonce_by_rank.move_to_end(rank_id)
+        while len(self._last_nonce_by_rank) > DEFAULT_SIDEBAND_REPLAY_CACHE_PEERS:
+            self._last_nonce_by_rank.popitem(last=False)
+        return True
+
+    @staticmethod
+    async def _close_writer(writer: asyncio.StreamWriter) -> None:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (OSError, ConnectionError):
+            pass
 
     def _heartbeat_from_payload(self, payload: object) -> Optional[ProgressHeartbeat]:
         if not isinstance(payload, dict):
@@ -403,8 +458,14 @@ class Sideband:
     def _server_ssl_context(self) -> Optional[ssl.SSLContext]:
         if not self._tls:
             return None
-        if self._tls_certfile is None or self._tls_keyfile is None:
-            raise ValueError("tls=True requires tls_certfile and tls_keyfile")
+        if (
+            self._tls_certfile is None
+            or self._tls_keyfile is None
+            or self._tls_ca_file is None
+        ):
+            raise ValueError(
+                "tls=True requires tls_certfile, tls_keyfile, and tls_ca_file"
+            )
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile=self._tls_certfile, keyfile=self._tls_keyfile)
         return context
@@ -413,30 +474,25 @@ class Sideband:
         if not self._tls:
             return None
         if self._tls_ca_file is None:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            return context
+            raise ValueError("tls=True requires tls_ca_file")
         context = ssl.create_default_context(cafile=self._tls_ca_file)
-        context.check_hostname = False
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
         return context
 
     def _warn_if_insecure_non_loopback_bind(self, host: str) -> None:
-        if self._psk is not None:
+        if self._psk is not None or self._tls:
             return
         if self._is_loopback_host(host):
             return
-        if Sideband._insecure_bind_warning_emitted:
-            return
         warnings.warn(
             "tsugi-mend sideband is binding a non-loopback address without "
-            "sideband_psk authentication. This preserves 0.1.x zero-config "
-            "behavior for trusted networks; secure-by-default auth is planned "
-            "for 0.2.0.",
+            "sideband_psk authentication or TLS peer verification. This "
+            "preserves 0.1.x zero-config behavior for trusted networks; "
+            "secure-by-default auth is planned for 0.2.0.",
             RuntimeWarning,
             stacklevel=2,
         )
-        Sideband._insecure_bind_warning_emitted = True
 
     @staticmethod
     def _valid_text(value: object) -> TypeGuard[str]:
