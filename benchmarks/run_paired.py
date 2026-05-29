@@ -55,6 +55,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -171,6 +172,9 @@ class BenchConfig:
     hardware_label: str = "local CPU (gloo); $0 cheap reproducible cell"
     # Internal: rendezvous file store path (set by the parent before spawn).
     _store_path: Optional[str] = field(default=None, repr=False)
+    # Bound c10d collectives so a failed rank raises in minutes instead of
+    # leaving peers parked until the backend's much longer default timeout.
+    process_group_timeout_s: float = 180.0
 
 
 @dataclass
@@ -256,6 +260,10 @@ def _validate_common_config(cfg: BenchConfig) -> None:
         raise ValueError(
             f"steps ({cfg.steps}) must be greater than warmup_steps "
             f"({cfg.warmup_steps})"
+        )
+    if cfg.process_group_timeout_s <= 0:
+        raise ValueError(
+            f"process_group_timeout_s must be > 0; got {cfg.process_group_timeout_s}"
         )
 
 
@@ -480,6 +488,10 @@ def _gather_fragments(
     ranks: int,
     object_group: Any,
 ) -> list[LearnerFragment]:
+    # If a peer rank dies mid-round, PyTorch raises after the process-group
+    # timeout configured at group creation. The benchmark intentionally does
+    # not implement failure-aware quorum unwind; job retry is the caller's
+    # responsibility.
     gathered: list[Optional[LearnerFragment]] = [None] * ranks
     dist.all_gather_object(gathered, local, group=object_group)
     return [f for f in gathered if f is not None]
@@ -667,12 +679,13 @@ def _create_rank_partition_group(
     *,
     backend: str,
     rank: int,
+    timeout: timedelta,
 ) -> tuple[Any, int, list[Any]]:
     selected_group = None
     selected_size = 0
     owned_groups: list[Any] = []
     for ranks in partitions:
-        group = dist.new_group(ranks=ranks, backend=backend)
+        group = dist.new_group(ranks=ranks, backend=backend, timeout=timeout)
         if rank in ranks and _is_real_group(group):
             selected_group = group
             selected_size = len(ranks)
@@ -684,6 +697,7 @@ def _create_rank_partition_group(
 
 def _make_distributed_context(cfg: BenchConfig, rank: int) -> _DistributedRunContext:
     world_size = dist.get_world_size()
+    timeout = _process_group_timeout(cfg)
     if _is_real_cell(cfg):
         local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
         local_rank = int(os.environ.get("LOCAL_RANK", str(rank % local_world_size)))
@@ -707,6 +721,7 @@ def _make_distributed_context(cfg: BenchConfig, rank: int) -> _DistributedRunCon
             node_partitions,
             backend=cfg.backend,
             rank=rank,
+            timeout=timeout,
         )
 
         # For LearnerFragment exchange, gather same-local-rank shards across
@@ -720,6 +735,7 @@ def _make_distributed_context(cfg: BenchConfig, rank: int) -> _DistributedRunCon
             shard_partitions,
             backend="gloo",
             rank=rank,
+            timeout=timeout,
         )
         return _DistributedRunContext(
             rank=rank,
@@ -733,7 +749,7 @@ def _make_distributed_context(cfg: BenchConfig, rank: int) -> _DistributedRunCon
             groups_to_destroy=fsdp_groups + object_groups,
         )
 
-    object_group = dist.new_group(backend="gloo")
+    object_group = dist.new_group(backend="gloo", timeout=timeout)
     return _DistributedRunContext(
         rank=rank,
         world_size=world_size,
@@ -757,6 +773,9 @@ def _run_rank_sequence(
     ctx: _DistributedRunContext,
 ) -> tuple[list[float], list[float], list[float], list[float]]:
     base_losses, base_ms = _run_baseline(cfg, ctx)
+    # These phase barriers are not recovery points. A rank failure here should
+    # fail the job after the explicit process-group timeout, not hang until the
+    # backend default timeout.
     dist.barrier()
     sdk_losses, sdk_ms = _run_sdk(cfg, ctx)
     dist.barrier()
@@ -769,7 +788,11 @@ def _worker(rank: int, cfg: BenchConfig, return_dict: Any) -> None:
     # bundled type stubs' explicit __all__; scope the ignore narrowly.
     store = dist.FileStore(cfg._store_path, cfg.ranks)  # type: ignore[attr-defined]
     dist.init_process_group(
-        backend=cfg.backend, store=store, rank=rank, world_size=cfg.ranks
+        backend=cfg.backend,
+        store=store,
+        rank=rank,
+        world_size=cfg.ranks,
+        timeout=_process_group_timeout(cfg),
     )
     ctx = _make_distributed_context(cfg, rank)
     try:
@@ -890,6 +913,10 @@ def _build_result_bundle(
     }
 
 
+def _process_group_timeout(cfg: BenchConfig) -> timedelta:
+    return timedelta(seconds=cfg.process_group_timeout_s)
+
+
 def _run_cell_selfspawn(cfg: BenchConfig) -> dict[str, Any]:
     mp.set_start_method("spawn", force=True)
     manager = mp.Manager()
@@ -928,7 +955,11 @@ def _run_cell_torchrun(cfg: BenchConfig) -> Optional[dict[str, Any]]:
         )
     if _is_real_cell(cfg):
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    dist.init_process_group(backend=cfg.backend, init_method="env://")
+    dist.init_process_group(
+        backend=cfg.backend,
+        init_method="env://",
+        timeout=_process_group_timeout(cfg),
+    )
     ctx = _make_distributed_context(cfg, rank)
     try:
         base_losses, base_ms, sdk_losses, sdk_ms = _run_rank_sequence(cfg, ctx)
@@ -1060,6 +1091,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--grace-window-ms", type=int, default=None)
     parser.add_argument("--simulated-merge-delay-ms", type=int, default=None)
+    parser.add_argument("--process-group-timeout-s", type=float, default=None)
     parser.add_argument("--bootstrap-resamples", type=int, default=None)
     parser.add_argument("--model-id", default=None)
     parser.add_argument("--tokenizer-id", default=None)
@@ -1091,6 +1123,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
         "lr": args.lr,
         "grace_window_ms": args.grace_window_ms,
         "simulated_merge_delay_ms": args.simulated_merge_delay_ms,
+        "process_group_timeout_s": args.process_group_timeout_s,
         "bootstrap_resamples": args.bootstrap_resamples,
         "model_id": args.model_id,
         "tokenizer_id": args.tokenizer_id,

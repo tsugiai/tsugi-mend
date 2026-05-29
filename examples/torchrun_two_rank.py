@@ -15,6 +15,7 @@ import asyncio
 import os
 import time
 from collections.abc import Callable, Sequence
+from datetime import timedelta
 from typing import Any
 
 import torch
@@ -43,6 +44,11 @@ class TinyModel(nn.Module):
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     return default if value is None else int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return default if value is None else float(value)
 
 
 def _prefix(rank: int) -> str:
@@ -117,7 +123,16 @@ def _merged_norm(tensors: Sequence[torch.Tensor]) -> float:
 
 
 def main() -> None:
-    dist.init_process_group(backend="gloo")
+    process_group_timeout_s = _env_float("MEND_PROCESS_GROUP_TIMEOUT_S", 180.0)
+    if process_group_timeout_s <= 0:
+        raise RuntimeError(
+            "MEND_PROCESS_GROUP_TIMEOUT_S must be positive; "
+            f"got {process_group_timeout_s}"
+        )
+    dist.init_process_group(
+        backend="gloo",
+        timeout=timedelta(seconds=process_group_timeout_s),
+    )
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = _env_int("LOCAL_RANK", rank)
@@ -161,6 +176,9 @@ def main() -> None:
         mend_started = True
         runtime = get_runtime(model)
 
+        # These collectives are not recovery points. If a peer rank dies, the
+        # explicit process-group timeout bounds the failure latency and the
+        # example process exits for the caller's launcher to handle.
         dist.barrier()
         _wait_for_sideband_peer(runtime, f"local-node/rank-{peer_rank}")
         print(
@@ -201,6 +219,8 @@ def main() -> None:
                     tokens_consumed=batch * features,
                 )
                 gathered: list[LearnerFragment | None] = [None] * world_size
+                # A peer failure during this gather becomes a bounded backend
+                # error through the process-group timeout configured at startup.
                 dist.all_gather_object(gathered, local_fragment)
                 fragments = [fragment for fragment in gathered if fragment is not None]
 

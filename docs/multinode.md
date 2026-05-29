@@ -77,6 +77,7 @@ Initialize regular PyTorch distributed first, then build and wrap the model, and
 only then call `mend_init`.
 
 ```python
+from datetime import timedelta
 import os
 
 import torch
@@ -85,7 +86,11 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from tsugi_mend import MendConfig, mend_init, mend_shutdown
 
-dist.init_process_group(backend="nccl")
+process_group_timeout_s = float(os.environ.get("MEND_PROCESS_GROUP_TIMEOUT_S", "180"))
+dist.init_process_group(
+    backend="nccl",
+    timeout=timedelta(seconds=process_group_timeout_s),
+)
 
 local_rank = int(os.environ["LOCAL_RANK"])
 global_rank = dist.get_rank()
@@ -129,37 +134,69 @@ For an eight-GPU node with `MEND_SIDEBAND_PORT_BASE=51900`, local ranks use
 TCP ports `51900` through `51907`. Each local rank peers with the same local-rank
 port on the other node.
 
-## 3. Two-node torchrun recipe
+## 3. Failure contract and timeout
+
+The SDK does not redesign PyTorch's failure semantics. If a rank raises or exits
+mid-outer-step, peer ranks may be inside a PyTorch collective such as
+`all_gather_object` or `barrier`. The integrator owns the job-level policy around
+that failure: fail the job, restart from checkpoint, or implement a higher-level
+retry loop around the training step and `outer_step_collect`.
+
+The process-group timeout bounds the blast radius. It converts a peer failure
+from an effectively unbounded wait into a PyTorch exception after a configured
+interval. The examples and benchmark default this to `180` seconds:
+
+```bash
+export MEND_PROCESS_GROUP_TIMEOUT_S=180
+```
+
+For the benchmark harness, the same setting is exposed as:
+
+```bash
+python benchmarks/run_paired.py \
+  --cell cpu_gloo_2rank_mlp \
+  --process-group-timeout-s 180
+```
+
+This timeout does not change happy-path numerics. It only controls how long a
+rank waits for a failed peer before the backend reports an error.
+
+## 4. Two-node torchrun recipe
 
 Choose one node to host rendezvous. In these commands, node 0 is the rendezvous
-host and both nodes run eight local processes. Replace placeholders with
-addresses reachable from the other training node.
+host and both nodes run eight local processes. The concrete values below are
+examples: node 0 has training IP `10.0.0.10`, node 1 has training IP
+`10.0.0.11`, and both nodes use training interface `eth0`. Replace them with
+addresses and an interface name reachable on your private training fabric.
 
 Common environment on both nodes:
 
 ```bash
 export NNODES=2
 export NPROC_PER_NODE=8
-export MASTER_ADDR=<node0-rdzv-address>
+export MASTER_ADDR=10.0.0.10
 export MASTER_PORT=29500
 export RDZV_BACKEND=c10d
 export RDZV_ENDPOINT="${MASTER_ADDR}:${MASTER_PORT}"
 export RDZV_ID=tsugi-mend-smoke-001
 export MEND_SIDEBAND_PORT_BASE=51900
+export MEND_PROCESS_GROUP_TIMEOUT_S=180
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
 ```
 
 Node 0 only:
 
 ```bash
 export NODE_RANK=0
-export MEND_SIDEBAND_PEERS=<node1-sideband-address>
+export MEND_SIDEBAND_PEERS=10.0.0.11
 ```
 
 Node 1 only:
 
 ```bash
 export NODE_RANK=1
-export MEND_SIDEBAND_PEERS=<node0-sideband-address>
+export MEND_SIDEBAND_PEERS=10.0.0.10
 ```
 
 Run the same `torchrun` command on both nodes:
@@ -180,7 +217,31 @@ torchrun \
 Use a unique `RDZV_ID` per active job so independent jobs do not join the same
 rendezvous group.
 
-## 4. Ports and firewall rules
+### Multi-NIC interface selection
+
+On hosts with multiple network interfaces, make `torchrun`, NCCL, gloo, and the
+Mend sideband use the same routable training fabric. First identify the private
+interface on each node:
+
+```bash
+ip -br addr
+```
+
+Then set `NCCL_SOCKET_IFNAME` to that interface before launching. For example,
+use `eth0` on Ethernet clusters or `ib0` on InfiniBand clusters:
+
+```bash
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+```
+
+If your host also has Docker, loopback, management, or public-cloud metadata
+interfaces, do not rely on NCCL's auto-selection. A wrong interface commonly
+shows up as rendezvous success followed by NCCL connection timeouts or peers
+trying to dial unroutable addresses. Keep `MASTER_ADDR` and
+`MEND_SIDEBAND_PEERS` on the same private fabric as `NCCL_SOCKET_IFNAME`.
+
+## 5. Ports and firewall rules
 
 Allow these inbound TCP paths between the training nodes:
 
@@ -202,7 +263,7 @@ If your launch environment uses NAT or containers, make sure
 `MEND_SIDEBAND_PEERS` contains addresses that peer nodes can actually dial, not
 container-local loopback addresses.
 
-## 5. Diagnostics JSONL
+## 6. Diagnostics JSONL
 
 Set `diagnostics_dir` in `MendConfig` for every rank. The runtime writes one
 append-only JSONL file per process:
@@ -245,7 +306,7 @@ Diagnostics are operational evidence, not a benchmark by themselves. For
 published or externally compared throughput numbers, use the paired-run protocol
 in [`docs/benchmark_protocol.md`](benchmark_protocol.md).
 
-## 6. Docker
+## 7. Docker
 
 Build the image from the repository root:
 
@@ -269,20 +330,23 @@ docker run --rm --gpus all --network host \
   -e NNODES=2 \
   -e NPROC_PER_NODE=8 \
   -e NODE_RANK="${NODE_RANK}" \
-  -e MASTER_ADDR="<node0-rdzv-address>" \
+  -e MASTER_ADDR="10.0.0.10" \
   -e MASTER_PORT=29500 \
   -e RDZV_BACKEND=c10d \
-  -e RDZV_ENDPOINT="<node0-rdzv-address>:29500" \
+  -e RDZV_ENDPOINT="10.0.0.10:29500" \
   -e RDZV_ID=tsugi-mend-smoke-001 \
   -e MEND_SIDEBAND_PORT_BASE=51900 \
-  -e MEND_SIDEBAND_PEERS="<peer-sideband-address>" \
+  -e MEND_PROCESS_GROUP_TIMEOUT_S=180 \
+  -e NCCL_SOCKET_IFNAME=eth0 \
+  -e GLOO_SOCKET_IFNAME=eth0 \
+  -e MEND_SIDEBAND_PEERS="${MEND_SIDEBAND_PEERS}" \
   tsugi-mend:local \
   torchrun \
     --nnodes=2 \
     --nproc-per-node=8 \
     --node-rank="${NODE_RANK}" \
     --rdzv-backend=c10d \
-    --rdzv-endpoint="<node0-rdzv-address>:29500" \
+    --rdzv-endpoint="10.0.0.10:29500" \
     --rdzv-id=tsugi-mend-smoke-001 \
     train.py
 ```
@@ -293,7 +357,7 @@ the sideband port range. Pass node-specific `NODE_RANK` and
 `MEND_SIDEBAND_PEERS` through the scheduler rather than hard-coding hostnames in
 the image.
 
-## 7. Real benchmark cell
+## 8. Real benchmark cell
 
 The benchmark harness also defines `real_8xv100_2node`, a GPU-deferred
 Hugging Face/FSDP cell for maintainer-run hardware validation. It is not a
