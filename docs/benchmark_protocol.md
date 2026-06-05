@@ -35,6 +35,48 @@ that either path is numerically equal to a vanilla DDP/FSDP all-reduce run.
 - Stage D: 3 paired runs minimum. Alternate baseline and sdk to interleave drift in cluster performance over time.
 - Stage E: 3 paired runs minimum. Same alternation rule.
 
+## Stall-sweep protocol
+
+The stall sweep is the local, reproducible harness for answering "when does the
+concurrent outer-step path help under injected peer slowdown?" It is a
+measurement tool only. It does not change SDK runtime behavior, enable rank
+exclusion, or alter the default lossless path.
+
+For each grid point:
+
+- Hold workload, seed-specific data, optimizer, sync cadence, and all SDK
+  settings fixed between the `baseline` and `sdk` paths.
+- Inject a deterministic fixed `straggler_delay_ms` on the configured peer-rank
+  set at the outer-step fragment-exchange boundary. This knob is distinct from
+  `simulated_merge_delay_ms`, which remains the symmetric merge-transport delay
+  inside the reducer finalize path.
+- Use `straggler_delay_ms` in `{0, 50, 100, 250, 500, 1000}` and peer-straggler
+  counts in `{0, 1, 2, 4}` for the full local grid. Rank 0 remains the reporting
+  observer; peer-straggler count 4 therefore requires at least 5 local CPU/gloo
+  ranks.
+- Run at least `n_seeds=5` paired trials per grid point. Alternate path order
+  across seeds (`baseline_sdk`, then `sdk_baseline`) to interleave local
+  performance drift.
+- Assert bit-exact loss equivalence on every seed. A bit-exact failure makes the
+  grid point invalid and the sweep exits non-zero. It is not treated as a slow
+  run.
+- Compute one SDK-over-baseline tokens/s uplift per seed. Drop the single
+  lowest and single highest seed-level uplift, then report mean, sample
+  variance, and a bootstrap 95% CI across the surviving seed-level uplifts.
+- Report p50, p95, and p99 step time for both paths, plus the mean tokens/s for
+  both paths.
+
+The expected public artifact is the uplift-vs-injected-stall curve, emitted as
+`benchmarks/results/<cell>/result.json`. The quick smoke
+(`python benchmarks/run_stall_sweep.py --quick`) uses the same n>=5/drop rule
+on a smaller `{0, 50}` ms x `{0, 1}` peer-straggler grid.
+
+The sweep may feed per-rank timing observations into `FailSlowDetector` in
+observe-only mode and record flagged ranks plus z-scores. This validates the
+detector signal under a known injected slowdown. The sweep must not call
+`mark_failslow`, exclude a learner from the merge quorum, or otherwise invoke
+mitigation, because that changes the numerical contract.
+
 ## 95% confidence intervals
 
 Use a bootstrap CI (10000 resamples). Report the CI alongside the point estimate every time the uplift is quoted.
