@@ -21,6 +21,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from benchmarks.metrics import (  # noqa: E402
+    aggregate_seeded_uplift,
     bit_exact_equal,
     bootstrap_uplift_ci,
     steady_state,
@@ -142,3 +143,40 @@ def test_bootstrap_rejects_mismatched_lengths():
 def test_bootstrap_requires_two_paired_steps():
     with pytest.raises(ValueError):
         bootstrap_uplift_ci([1.0], [1.0], n_resamples=10)
+
+
+# -------------------------- aggregate_seeded_uplift -------------------------
+
+
+def test_seeded_uplift_drops_fastest_and_slowest_then_aggregates():
+    summary = aggregate_seeded_uplift(
+        [-50.0, 10.0, 20.0, 30.0, 100.0],
+        n_resamples=500,
+        seed=123,
+    )
+    assert summary.n_runs == 5
+    assert summary.n_surviving_runs == 3
+    assert summary.dropped_low_pct == pytest.approx(-50.0)
+    assert summary.dropped_high_pct == pytest.approx(100.0)
+    assert summary.surviving_uplifts_pct == (10.0, 20.0, 30.0)
+    assert summary.mean_uplift_pct == pytest.approx(20.0)
+    assert summary.sample_variance_pct2 == pytest.approx(100.0)
+    assert summary.ci_low_pct <= summary.mean_uplift_pct <= summary.ci_high_pct
+
+
+def test_seeded_uplift_bootstrap_is_deterministic_for_fixed_seed():
+    values = [3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    a = aggregate_seeded_uplift(values, n_resamples=1000, seed=9)
+    b = aggregate_seeded_uplift(values, n_resamples=1000, seed=9)
+    assert a.ci_low_pct == b.ci_low_pct
+    assert a.ci_high_pct == b.ci_high_pct
+
+
+def test_seeded_uplift_requires_at_least_five_runs():
+    with pytest.raises(ValueError, match="n>=5"):
+        aggregate_seeded_uplift([1.0, 2.0, 3.0, 4.0], n_resamples=10)
+
+
+def test_seeded_uplift_rejects_nonfinite_values():
+    with pytest.raises(ValueError, match="finite"):
+        aggregate_seeded_uplift([1.0, 2.0, 3.0, 4.0, float("inf")], n_resamples=10)

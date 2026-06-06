@@ -40,8 +40,10 @@ driver then:
 ```
 benchmarks/
   metrics.py                       pure helpers: bit_exact_equal, steady_state,
-                                   bootstrap_uplift_ci (unit-tested)
+                                   bootstrap_uplift_ci, aggregate_seeded_uplift
+                                   (unit-tested)
   run_paired.py                    config-driven paired-run driver
+  run_stall_sweep.py               seeded peer-straggler sweep driver
   results/<cell>/result.json       committed result bundle (schema below)
   results/<cell>/README.md         per-cell reproduction notes
 ```
@@ -83,11 +85,77 @@ This is still a $0 CPU/gloo run. It validates that each torchrun process acts
 as one benchmark rank, that rank 0 writes the bundle, and that fragment object
 gather uses a dedicated gloo process group rather than the data-plane backend.
 
+## Run the stall sweep ($0 quick smoke)
+
+The stall sweep injects a fixed extra wait on selected peer ranks at the
+outer-step fragment-exchange boundary. This is distinct from
+`simulated_merge_delay_ms`: the simulated merge delay is symmetric transport
+cost inside the reducer finalize path, while `straggler_delay_ms` models one or
+more slow peers reaching the merge boundary late. Both paths receive the same
+injected wait. The baseline blocks on it through synchronous fragment exchange;
+the SDK path submits the exchange to the concurrent outer-step provider so the
+training thread can overlap it.
+
+Quick smoke:
+
+```bash
+python benchmarks/run_stall_sweep.py --quick
+```
+
+Expected output shape:
+
+```
+======================================================================================
+cell: cpu_gloo_stall_sweep_quick  (quick stall sweep)
+bit-exact loss equivalence: PASS (max |loss diff| = 0.000e+00)
+delay=   0 ms  stragglers=0  bit_exact=PASS  uplift=<...>% CI95 [<...>%, <...>%]  p95 baseline/sdk=<...>/<...> ms
+delay=   0 ms  stragglers=1  bit_exact=PASS  uplift=<...>% CI95 [<...>%, <...>%]  p95 baseline/sdk=<...>/<...> ms
+delay= 100 ms  stragglers=0  bit_exact=PASS  uplift=<...>% CI95 [<...>%, <...>%]  p95 baseline/sdk=<...>/<...> ms
+delay= 100 ms  stragglers=1  bit_exact=PASS  uplift=<...>% CI95 [<...>%, <...>%]  p95 baseline/sdk=<...>/<...> ms
+======================================================================================
+wrote bundle: benchmarks/results/cpu_gloo_stall_sweep_quick/result.json
+```
+
+The quick mode still uses `n_seeds=5`, so every grid point exercises the
+run-level aggregation rule: compute each seed's paired tokens/s uplift, drop
+the single lowest and highest uplift, then report mean, sample variance, and a
+bootstrap 95% CI across the surviving seed-level uplifts. It uses a reduced
+model shape, fewer steps, the delay grid `{0, 100}` ms, and straggler counts
+`{0, 1}` so it is suitable as a local smoke. The model shape is still sized so a
+single inner step costs a few milliseconds, keeping the smoke's uplift numbers
+interpretable rather than dominated by sub-millisecond orchestration overhead.
+
+Full local grid:
+
+```bash
+python benchmarks/run_stall_sweep.py
+```
+
+The full grid uses `straggler_delay_ms` in `{0, 50, 100, 250, 500, 1000}` and
+peer-straggler counts in `{0, 1, 2, 4}`. The default full sweep uses five local
+CPU/gloo ranks so rank 0 can remain the reporting observer while ranks 1..4
+serve as the maximum peer-straggler set. The full run is intentionally not a CI
+gate; it is a local measurement artifact.
+
+The sweep writes `benchmarks/results/<cell>/result.json` with one row per grid
+point. Each row includes:
+
+- `delay_ms`, `straggler_count`, and the concrete `straggler_ranks`.
+- `mean_uplift_pct`, `sample_variance_pct2`, and `ci95_low_pct` /
+  `ci95_high_pct` after dropping the fastest and slowest seed-level uplifts.
+- `bit_exact_pass` and `max_abs_loss_diff`; any seed that fails bit-exact loss
+  equivalence invalidates the grid point and exits non-zero.
+- `p50/p95/p99` step time means for both paths and mean tokens/s for both paths.
+- an observe-only `FailSlowDetector` report. The sweep feeds per-rank timing
+  observations into the detector and records flagged ranks and z-scores, but it
+  never calls rank exclusion or quorum-dropping mitigation.
+
 ## Cells: cheap-reproducible vs real hardware
 
 | Cell | Backend | Reproducible at | Notes |
 |---|---|---|---|
 | `cpu_gloo_2rank_mlp` | `gloo` (CPU) | **$0, any laptop** | the cheap cell; synthetic MLP, 2 local ranks, injected merge delay |
+| `cpu_gloo_stall_sweep_quick` | `gloo` (CPU) | **$0, any laptop** | quick seeded peer-straggler sweep result bundle |
 | `real_8xv100_2node` | `nccl` (GPU) | a real GPU cluster (**out of scope here**) | Hugging Face causal LM, per-node FSDP sharding, deterministic token stream, no simulated merge delay |
 
 ### Real multi-node Hugging Face/FSDP cell

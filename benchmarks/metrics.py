@@ -10,6 +10,10 @@ These functions implement the numeric core of ``docs/benchmark_protocol.md``:
                            step time).
 - ``bootstrap_uplift_ci``  paired-resample bootstrap 95% CI for the tokens/s
                            uplift of the SDK path over the baseline path.
+- ``aggregate_seeded_uplift``
+                           run-level n>=5 aggregation: drop the fastest and
+                           slowest paired uplifts, then report mean, sample
+                           variance, and bootstrap CI over the surviving runs.
 
 Everything here is pure Python + the standard library (``random``,
 ``statistics``, ``math``). No torch import, no network, no global state, so
@@ -136,6 +140,23 @@ class UpliftCI:
     confidence: float
 
 
+@dataclass(frozen=True)
+class SeededUpliftSummary:
+    """Run-level uplift summary after dropping the fastest and slowest runs."""
+
+    n_runs: int
+    n_surviving_runs: int
+    dropped_low_pct: float
+    dropped_high_pct: float
+    mean_uplift_pct: float
+    sample_variance_pct2: float
+    ci_low_pct: float
+    ci_high_pct: float
+    n_resamples: int
+    confidence: float
+    surviving_uplifts_pct: tuple[float, ...]
+
+
 def _uplift_pct_from_times(
     baseline_step_times_ms: Sequence[float],
     sdk_step_times_ms: Sequence[float],
@@ -205,10 +226,69 @@ def bootstrap_uplift_ci(
     )
 
 
+def aggregate_seeded_uplift(
+    uplift_pcts: Sequence[float],
+    n_resamples: int = 10000,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> SeededUpliftSummary:
+    """Aggregate per-seed paired-run uplifts.
+
+    The stall-sweep protocol runs n>=5 paired baseline/sdk trials per grid
+    point. Following the MLPerf-style convention in the task brief, this helper
+    drops the single lowest and single highest per-run uplift, then computes
+    the mean, sample variance, and an ordinary bootstrap CI across the
+    surviving run-level uplifts.
+    """
+    values = [float(v) for v in uplift_pcts]
+    if len(values) < 5:
+        raise ValueError(f"need n>=5 seeded uplifts; got {len(values)}")
+    if not (0.0 < confidence < 1.0):
+        raise ValueError(f"confidence must be in (0, 1); got {confidence}")
+    if n_resamples < 1:
+        raise ValueError(f"n_resamples must be >= 1; got {n_resamples}")
+    if any(math.isnan(v) or math.isinf(v) for v in values):
+        raise ValueError("uplift_pcts must be finite")
+
+    ordered = sorted(values)
+    dropped_low = ordered[0]
+    dropped_high = ordered[-1]
+    surviving = ordered[1:-1]
+    mean = statistics.fmean(surviving)
+    variance = statistics.variance(surviving)
+
+    rng = random.Random(seed)
+    n = len(surviving)
+    resampled_means: list[float] = []
+    for _ in range(n_resamples):
+        sample = [surviving[rng.randrange(n)] for _ in range(n)]
+        resampled_means.append(statistics.fmean(sample))
+    resampled_means.sort()
+    alpha = 1.0 - confidence
+    low = _percentile(resampled_means, alpha / 2.0)
+    high = _percentile(resampled_means, 1.0 - alpha / 2.0)
+
+    return SeededUpliftSummary(
+        n_runs=len(values),
+        n_surviving_runs=len(surviving),
+        dropped_low_pct=dropped_low,
+        dropped_high_pct=dropped_high,
+        mean_uplift_pct=mean,
+        sample_variance_pct2=variance,
+        ci_low_pct=low,
+        ci_high_pct=high,
+        n_resamples=n_resamples,
+        confidence=confidence,
+        surviving_uplifts_pct=tuple(surviving),
+    )
+
+
 __all__ = [
     "bit_exact_equal",
     "steady_state",
     "StepSummary",
     "bootstrap_uplift_ci",
     "UpliftCI",
+    "aggregate_seeded_uplift",
+    "SeededUpliftSummary",
 ]

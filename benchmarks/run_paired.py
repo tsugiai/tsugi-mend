@@ -162,7 +162,18 @@ class BenchConfig:
     # delta at $0; the baseline blocks, the SDK overlaps.
     grace_window_ms: int = 0
     simulated_merge_delay_ms: int = 12
+    # Reproducible peer-straggler injector. This is distinct from
+    # simulated_merge_delay_ms: the simulated merge delay is a symmetric
+    # transport/grace wait inside GraceWindowSyncer._finalize, while the
+    # straggler delay is a fixed per-rank wait immediately before fragment
+    # exchange at an outer-step boundary. Default OFF preserves every
+    # existing cell.
+    straggler_delay_ms: int = 0
+    straggler_ranks: tuple[int, ...] = ()
     bootstrap_resamples: int = 10000
+    # The stall sweep alternates this across seeds to interleave drift.
+    # The default remains the original baseline -> sdk order.
+    path_order: str = "baseline_sdk"
     # For a real (non-cheap) cell, the HF identifiers + hardware label are
     # passed through into the bundle for the reproduction contract. None on
     # the cheap synthetic cell.
@@ -172,6 +183,7 @@ class BenchConfig:
     hardware_label: str = "local CPU (gloo); $0 cheap reproducible cell"
     # Internal: rendezvous file store path (set by the parent before spawn).
     _store_path: Optional[str] = field(default=None, repr=False)
+    _include_rank_timings: bool = field(default=False, repr=False)
     # Bound c10d collectives so a failed rank raises in minutes instead of
     # leaving peers parked until the backend's much longer default timeout.
     process_group_timeout_s: float = 180.0
@@ -264,6 +276,20 @@ def _validate_common_config(cfg: BenchConfig) -> None:
     if cfg.process_group_timeout_s <= 0:
         raise ValueError(
             f"process_group_timeout_s must be > 0; got {cfg.process_group_timeout_s}"
+        )
+    if cfg.straggler_delay_ms < 0:
+        raise ValueError(f"straggler_delay_ms must be >= 0; got {cfg.straggler_delay_ms}")
+    if len(set(cfg.straggler_ranks)) != len(cfg.straggler_ranks):
+        raise ValueError(f"straggler_ranks must be unique; got {cfg.straggler_ranks}")
+    for rank in cfg.straggler_ranks:
+        if rank < 0 or rank >= cfg.ranks:
+            raise ValueError(
+                f"straggler rank {rank} is outside configured ranks [0, {cfg.ranks})"
+            )
+    if cfg.path_order not in {"baseline_sdk", "sdk_baseline"}:
+        raise ValueError(
+            "path_order must be 'baseline_sdk' or 'sdk_baseline'; "
+            f"got {cfg.path_order!r}"
         )
 
 
@@ -497,6 +523,11 @@ def _gather_fragments(
     return [f for f in gathered if f is not None]
 
 
+def _maybe_inject_straggler_delay(cfg: BenchConfig, ctx: _DistributedRunContext) -> None:
+    if cfg.straggler_delay_ms > 0 and ctx.rank in cfg.straggler_ranks:
+        time.sleep(cfg.straggler_delay_ms / 1000.0)
+
+
 def _synchronous_merge(
     syncer: GraceWindowSyncer, fragments: list[LearnerFragment], round_id: int
 ) -> list[torch.Tensor]:
@@ -556,6 +587,7 @@ def _run_baseline(
 
         if step > 0 and step % cfg.sync_period_steps == 0:
             local = _build_fragment(model, prev, ctx.learner_id, step, tokens_per_step)
+            _maybe_inject_straggler_delay(cfg, ctx)
             fragments = _gather_fragments(local, ctx.object_world_size, ctx.object_group)
             merged = _synchronous_merge(syncer, fragments, round_id=step)
             pending = (step + cfg.apply_lag_steps, merged)
@@ -572,9 +604,12 @@ def _distributed_fragment_provider_factory(
     local: LearnerFragment,
     ranks: int,
     object_group: Any,
+    cfg: BenchConfig,
+    ctx: _DistributedRunContext,
 ) -> FragmentProvider:
     def provider() -> "asyncio.Queue[LearnerFragment]":
         queue: asyncio.Queue[LearnerFragment] = asyncio.Queue()
+        _maybe_inject_straggler_delay(cfg, ctx)
         fragments = _gather_fragments(local, ranks, object_group)
         for f in fragments:
             queue.put_nowait(f)
@@ -641,6 +676,8 @@ def _run_sdk(
                         local,
                         ctx.object_world_size,
                         ctx.object_group,
+                        cfg,
+                        ctx,
                     ),
                 )
                 apply_at = step + cfg.apply_lag_steps
@@ -772,13 +809,21 @@ def _run_rank_sequence(
     cfg: BenchConfig,
     ctx: _DistributedRunContext,
 ) -> tuple[list[float], list[float], list[float], list[float]]:
-    base_losses, base_ms = _run_baseline(cfg, ctx)
-    # These phase barriers are not recovery points. A rank failure here should
-    # fail the job after the explicit process-group timeout, not hang until the
-    # backend default timeout.
-    dist.barrier()
-    sdk_losses, sdk_ms = _run_sdk(cfg, ctx)
-    dist.barrier()
+    if cfg.path_order == "baseline_sdk":
+        base_losses, base_ms = _run_baseline(cfg, ctx)
+        # These phase barriers are not recovery points. A rank failure here should
+        # fail the job after the explicit process-group timeout, not hang until the
+        # backend default timeout.
+        dist.barrier()
+        sdk_losses, sdk_ms = _run_sdk(cfg, ctx)
+        dist.barrier()
+    elif cfg.path_order == "sdk_baseline":
+        sdk_losses, sdk_ms = _run_sdk(cfg, ctx)
+        dist.barrier()
+        base_losses, base_ms = _run_baseline(cfg, ctx)
+        dist.barrier()
+    else:
+        raise ValueError(f"unsupported path_order {cfg.path_order!r}")
     return base_losses, base_ms, sdk_losses, sdk_ms
 
 
@@ -797,6 +842,9 @@ def _worker(rank: int, cfg: BenchConfig, return_dict: Any) -> None:
     ctx = _make_distributed_context(cfg, rank)
     try:
         base_losses, base_ms, sdk_losses, sdk_ms = _run_rank_sequence(cfg, ctx)
+        if cfg._include_rank_timings:
+            return_dict[f"rank_{rank}_baseline_step_ms"] = base_ms
+            return_dict[f"rank_{rank}_sdk_step_ms"] = sdk_ms
         if rank == 0:
             return_dict["baseline_losses"] = base_losses
             return_dict["baseline_step_ms"] = base_ms
@@ -818,6 +866,7 @@ def _build_result_bundle(
     base_ms: list[float],
     sdk_losses: list[float],
     sdk_ms: list[float],
+    per_rank_step_ms: Optional[dict[str, dict[str, list[float]]]] = None,
 ) -> dict[str, Any]:
     bit_exact = bit_exact_equal(base_losses, sdk_losses)
     tokens_per_step = _tokens_per_step(cfg)
@@ -830,7 +879,7 @@ def _build_result_bundle(
         seed=cfg.seed,
     )
 
-    return {
+    bundle = {
         "schema_version": "1.0",
         "cell": cfg.cell,
         "reproducible": _reproducible_label(cfg),
@@ -866,6 +915,8 @@ def _build_result_bundle(
             "sync_period_steps": cfg.sync_period_steps,
             "apply_lag_steps": cfg.apply_lag_steps,
             "simulated_merge_delay_ms": cfg.simulated_merge_delay_ms,
+            "straggler_delay_ms": cfg.straggler_delay_ms,
+            "straggler_ranks": list(cfg.straggler_ranks),
             "outer_step_compression_mode": "none",
             "concurrent_outer_step": True,
             "token_weighted_merge": True,
@@ -874,6 +925,7 @@ def _build_result_bundle(
             "steps": cfg.steps,
             "warmup_steps": cfg.warmup_steps,
             "n_steady_steps": base_summary.n_steps_steady,
+            "path_order": cfg.path_order,
         },
         "bit_exact_loss_equivalence": {
             "passed": bit_exact,
@@ -911,6 +963,9 @@ def _build_result_bundle(
             },
         },
     }
+    if cfg._include_rank_timings and per_rank_step_ms is not None:
+        bundle["per_rank_step_ms"] = per_rank_step_ms
+    return bundle
 
 
 def _process_group_timeout(cfg: BenchConfig) -> timedelta:
@@ -933,12 +988,23 @@ def _run_cell_selfspawn(cfg: BenchConfig) -> dict[str, Any]:
             if p.exitcode != 0:
                 raise RuntimeError(f"worker exited with code {p.exitcode}")
 
+    per_rank_step_ms = None
+    if cfg._include_rank_timings:
+        per_rank_step_ms = {
+            str(rank): {
+                "baseline": list(return_dict[f"rank_{rank}_baseline_step_ms"]),
+                "sdk": list(return_dict[f"rank_{rank}_sdk_step_ms"]),
+            }
+            for rank in range(cfg.ranks)
+        }
+
     return _build_result_bundle(
         cfg,
         list(return_dict["baseline_losses"]),
         list(return_dict["baseline_step_ms"]),
         list(return_dict["sdk_losses"]),
         list(return_dict["sdk_step_ms"]),
+        per_rank_step_ms=per_rank_step_ms,
     )
 
 
@@ -1066,6 +1132,18 @@ CELLS: dict[str, BenchConfig] = {
 }
 
 
+def _parse_rank_tuple(value: str) -> tuple[int, ...]:
+    text = value.strip()
+    if not text:
+        return ()
+    try:
+        return tuple(int(part.strip()) for part in text.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"rank list must be comma-separated integers; got {value!r}"
+        ) from exc
+
+
 def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1091,6 +1169,19 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--grace-window-ms", type=int, default=None)
     parser.add_argument("--simulated-merge-delay-ms", type=int, default=None)
+    parser.add_argument("--straggler-delay-ms", type=int, default=None)
+    parser.add_argument(
+        "--straggler-ranks",
+        type=_parse_rank_tuple,
+        default=None,
+        help="comma-separated rank ids that get a fixed outer-boundary delay",
+    )
+    parser.add_argument(
+        "--path-order",
+        choices=("baseline_sdk", "sdk_baseline"),
+        default=None,
+        help="paired-run phase order; the stall sweep alternates this across seeds",
+    )
     parser.add_argument("--process-group-timeout-s", type=float, default=None)
     parser.add_argument("--bootstrap-resamples", type=int, default=None)
     parser.add_argument("--model-id", default=None)
@@ -1123,6 +1214,9 @@ def _parse_args(argv: Optional[list[str]] = None) -> BenchConfig:
         "lr": args.lr,
         "grace_window_ms": args.grace_window_ms,
         "simulated_merge_delay_ms": args.simulated_merge_delay_ms,
+        "straggler_delay_ms": args.straggler_delay_ms,
+        "straggler_ranks": args.straggler_ranks,
+        "path_order": args.path_order,
         "process_group_timeout_s": args.process_group_timeout_s,
         "bootstrap_resamples": args.bootstrap_resamples,
         "model_id": args.model_id,
