@@ -170,6 +170,25 @@ class MendConfig:
     failslow_min_samples: int = 10
 
     # ------------------------------------------------------------------
+    # Online runtime autotuner (FALCON-inspired scheduling controls)
+    # ------------------------------------------------------------------
+    # Continuously adapts fail-slow detector sensitivity and the
+    # grace-window wall-clock wait from observed per-rank step times.
+    # It never changes merge cadence, merge math, quorum membership, or
+    # rank exclusion. Default OFF preserves the existing runtime behavior.
+    auto_tune_runtime: bool = False
+    # Clamp range for the effective fail-slow z-score threshold when
+    # auto_tune_runtime is enabled. The configured static
+    # failslow_zscore_threshold is always included in the effective clamp
+    # range so existing valid configs remain constructible.
+    auto_tune_failslow_zscore_min: float = 1.5
+    auto_tune_failslow_zscore_max: float = 6.0
+    # Upper bound for the effective wall-clock grace-window wait when
+    # auto_tune_runtime is enabled. The configured static grace_window_ms
+    # is always included in the effective clamp range.
+    auto_tune_grace_window_max_ms: int = 10_000
+
+    # ------------------------------------------------------------------
     # Rack-aware topology
     # ------------------------------------------------------------------
     # Whether the runtime should attempt rack-aware DP-last mapping.
@@ -250,6 +269,23 @@ class MendConfig:
             raise ValueError(
                 f"failslow_min_samples ({self.failslow_min_samples}) cannot exceed "
                 f"failslow_window_steps ({self.failslow_window_steps})"
+            )
+        if self.auto_tune_failslow_zscore_min <= 0:
+            raise ValueError(
+                "auto_tune_failslow_zscore_min must be > 0; "
+                f"got {self.auto_tune_failslow_zscore_min}"
+            )
+        if self.auto_tune_failslow_zscore_max < self.auto_tune_failslow_zscore_min:
+            raise ValueError(
+                "auto_tune_failslow_zscore_max must be >= "
+                "auto_tune_failslow_zscore_min; got "
+                f"{self.auto_tune_failslow_zscore_max} < "
+                f"{self.auto_tune_failslow_zscore_min}"
+            )
+        if self.auto_tune_grace_window_max_ms < 0:
+            raise ValueError(
+                "auto_tune_grace_window_max_ms must be >= 0; "
+                f"got {self.auto_tune_grace_window_max_ms}"
             )
         if self.sideband_heartbeat_ms < 1:
             raise ValueError(

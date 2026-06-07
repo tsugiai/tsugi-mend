@@ -8,6 +8,7 @@ expected boundaries.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 
@@ -264,6 +265,24 @@ def _drive_step_loop(runtime, n_steps: int, step_sleep_s: float) -> None:
         runtime.step_end(step)
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self._now_s = 0.0
+
+    def monotonic(self) -> float:
+        return self._now_s
+
+    def advance_ms(self, ms: float) -> None:
+        self._now_s += ms / 1000.0
+
+
+def _drive_fake_step_times(runtime, step_times_ms: list[float], clock: _FakeClock) -> None:
+    for step, step_time_ms in enumerate(step_times_ms):
+        runtime.step_begin(step)
+        clock.advance_ms(step_time_ms)
+        runtime.step_end(step)
+
+
 def test_auto_tuner_off_preserves_static_sync_period(tmp_path):
     """When config.auto_tune_sync_period is False (default), the
     effective sync period must equal the static config value across
@@ -419,6 +438,122 @@ def test_auto_tuner_min_above_max_rejected_at_config_init():
             sync_period_steps=4,
             auto_tune_sync_period_min=8,  # invalid; exceeds upper bound
         )
+
+
+def test_runtime_autotuner_adapts_observe_only_controls(tmp_path, monkeypatch):
+    """The runtime autotuner adapts threshold and grace wait from a synthetic
+    stream, emits diagnostics, and never invokes rank exclusion."""
+    clock = _FakeClock()
+    monkeypatch.setattr("tsugi_mend.runtime.time.monotonic", clock.monotonic)
+
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=1,
+        grace_window_ms=10,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=False,
+        sideband_peers=(),
+        failslow_window_steps=8,
+        failslow_min_samples=4,
+        failslow_zscore_threshold=1.8,
+        auto_tune_runtime=True,
+        auto_tune_failslow_zscore_min=1.5,
+        auto_tune_failslow_zscore_max=5.0,
+        auto_tune_grace_window_max_ms=200,
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+
+    def forbidden_mark_failslow(_: str) -> None:
+        raise AssertionError("runtime autotuner must not exclude ranks")
+
+    monkeypatch.setattr(rt.syncer, "mark_failslow", forbidden_mark_failslow)
+
+    try:
+        _drive_fake_step_times(
+            rt,
+            [100.0, 100.0, 100.0, 100.0, 220.0, 230.0, 100.0, 100.0],
+            clock,
+        )
+        assert rt.effective_failslow_zscore_threshold() > 1.8
+        assert rt.effective_grace_window_ms() > 10
+    finally:
+        mend_shutdown(model)
+
+    diag_files = list((tmp_path / "diag").glob("max_sdk_pid*.jsonl"))
+    assert diag_files
+    events = [json.loads(line) for line in open(diag_files[0])]
+    init_event = next(e for e in events if e["event"] == "mend_init")
+    assert init_event["auto_tune_runtime_active"] is True
+
+    slow_events = [e for e in events if e["event"] == "failslow_decision"]
+    assert slow_events, "injected straggler should be flagged by the detector"
+
+    autotune_events = [e for e in events if e["event"] == "runtime_autotune_decision"]
+    assert autotune_events
+    assert any(e["threshold_action"] == "increase" for e in autotune_events)
+    assert any(e["grace_action"] == "increase" for e in autotune_events)
+    assert all(e["rank_id"] == "rack-0/rank-0" for e in autotune_events)
+
+
+def test_runtime_autotuner_on_preserves_bit_exact_loss_trajectory(
+    tmp_path,
+    monkeypatch,
+):
+    """Enabling runtime autotune must not change model math."""
+    torch.manual_seed(1234)
+    baseline_model = ToyLoraStyleModel()
+    sdk_model = copy.deepcopy(baseline_model)
+    baseline_optimizer = torch.optim.SGD(baseline_model.parameters(), lr=0.01)
+    sdk_optimizer = torch.optim.SGD(sdk_model.parameters(), lr=0.01)
+    inputs = [torch.randn(4, 16) for _ in range(12)]
+    targets = [torch.randn(4, 16) for _ in range(12)]
+
+    baseline_losses: list[float] = []
+    for batch, target in zip(inputs, targets):
+        baseline_optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(baseline_model(batch), target)
+        loss.backward()
+        baseline_optimizer.step()
+        baseline_losses.append(float(loss.item()))
+
+    clock = _FakeClock()
+    monkeypatch.setattr("tsugi_mend.runtime.time.monotonic", clock.monotonic)
+    config = MendConfig(
+        quorum_min_learners=1,
+        grace_window_ms=10,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=False,
+        sideband_peers=(),
+        failslow_window_steps=6,
+        failslow_min_samples=3,
+        failslow_zscore_threshold=2.0,
+        auto_tune_runtime=True,
+        auto_tune_grace_window_max_ms=200,
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(sdk_model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(sdk_model)
+    sdk_losses: list[float] = []
+    step_times_ms = [100.0, 100.0, 100.0, 220.0, 230.0, 100.0] * 2
+    try:
+        for step, (batch, target) in enumerate(zip(inputs, targets)):
+            rt.step_begin(step)
+            sdk_optimizer.zero_grad()
+            loss = torch.nn.functional.mse_loss(sdk_model(batch), target)
+            loss.backward()
+            sdk_optimizer.step()
+            sdk_losses.append(float(loss.item()))
+            clock.advance_ms(step_times_ms[step])
+            rt.step_end(step)
+    finally:
+        mend_shutdown(sdk_model)
+
+    assert baseline_losses == sdk_losses
+    assert max(abs(a - b) for a, b in zip(baseline_losses, sdk_losses)) == 0.0
 
 
 def test_full_training_loop_with_concurrent_outer_step(tmp_path):

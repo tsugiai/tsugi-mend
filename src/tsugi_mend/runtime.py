@@ -30,6 +30,7 @@ from typing import Optional
 
 import torch.nn as nn
 
+from tsugi_mend.autotuner import RuntimeAutotuner
 from tsugi_mend.async_tp import enable_async_tp
 from tsugi_mend.concurrent import ConcurrentOuterStep, FragmentProvider
 from tsugi_mend.config import MendConfig
@@ -67,6 +68,17 @@ class _MaxRuntime:
             simulated_merge_delay_ms=config.simulated_merge_delay_ms,
             simulated_merge_delay_distribution=config.simulated_merge_delay_distribution,
         )
+        self.runtime_autotuner: Optional[RuntimeAutotuner] = None
+        if config.auto_tune_runtime:
+            self.runtime_autotuner = RuntimeAutotuner(
+                base_failslow_zscore_threshold=config.failslow_zscore_threshold,
+                failslow_zscore_min=config.auto_tune_failslow_zscore_min,
+                failslow_zscore_max=config.auto_tune_failslow_zscore_max,
+                base_grace_window_ms=config.grace_window_ms,
+                grace_window_max_ms=config.auto_tune_grace_window_max_ms,
+                window_steps=config.failslow_window_steps,
+                min_samples=config.failslow_min_samples,
+            )
         self.sideband: Optional[Sideband] = None
         if config.sideband_peers:
             self.sideband = Sideband(
@@ -156,6 +168,9 @@ class _MaxRuntime:
             hostname=self.hostname,
             async_tp_active=self.async_tp_active,
             concurrent_outer_step_active=self._concurrent_orch is not None,
+            auto_tune_runtime_active=self.runtime_autotuner is not None,
+            effective_failslow_zscore_threshold=self.effective_failslow_zscore_threshold(),
+            effective_grace_window_ms=self.effective_grace_window_ms(),
             topology_method=self.topology.detection_method,
             n_racks=self.topology.n_racks(),
         )
@@ -213,7 +228,42 @@ class _MaxRuntime:
                 z_score=decision.z_score,
                 window_mean_ms=decision.window_mean_ms,
                 window_std_ms=decision.window_std_ms,
+                effective_failslow_zscore_threshold=(
+                    self.effective_failslow_zscore_threshold()
+                ),
+                effective_grace_window_ms=self.effective_grace_window_ms(),
                 reason=decision.reason,
+            )
+        if self.runtime_autotuner is not None:
+            autotune_decision = self.runtime_autotuner.observe(
+                rank_id=self.rank_id,
+                step_time_ms=step_time_ms,
+                detector_z_score=decision.z_score,
+                detector_flagged_slow=decision.is_slow,
+            )
+            self.failslow.zscore_threshold = (
+                autotune_decision.effective_failslow_zscore_threshold
+            )
+            self.syncer.grace_window_ms = autotune_decision.effective_grace_window_ms
+            self.diagnostics.emit(
+                "runtime_autotune_decision",
+                step=step,
+                rank_id=autotune_decision.rank_id,
+                step_time_ms=autotune_decision.step_time_ms,
+                window_size=autotune_decision.window_size,
+                window_mean_ms=autotune_decision.window_mean_ms,
+                window_std_ms=autotune_decision.window_std_ms,
+                jitter_ratio=autotune_decision.jitter_ratio,
+                aggregate_jitter_ratio=autotune_decision.aggregate_jitter_ratio,
+                detector_z_score=autotune_decision.detector_z_score,
+                detector_flagged_slow=autotune_decision.detector_flagged_slow,
+                effective_failslow_zscore_threshold=(
+                    autotune_decision.effective_failslow_zscore_threshold
+                ),
+                effective_grace_window_ms=autotune_decision.effective_grace_window_ms,
+                threshold_action=autotune_decision.threshold_action,
+                grace_action=autotune_decision.grace_action,
+                reason=autotune_decision.reason,
             )
         # Auto-tuner warmup-window measurement. Active only
         # when config.auto_tune_sync_period is True AND a decision has
@@ -238,6 +288,14 @@ class _MaxRuntime:
         not yet fired; equals the auto-tuned N* once the warmup
         boundary has been crossed."""
         return self._effective_sync_period_steps
+
+    def effective_failslow_zscore_threshold(self) -> float:
+        """Current z-score threshold used by the fail-slow detector."""
+        return self.failslow.zscore_threshold
+
+    def effective_grace_window_ms(self) -> int:
+        """Current grace-window wait used by the syncer."""
+        return self.syncer.grace_window_ms
 
     def _decide_auto_tune(self, step: int) -> None:
         """Compute N* from the warmup window's median step time and

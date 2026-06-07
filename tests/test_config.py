@@ -16,6 +16,10 @@ def test_defaults_construct():
     assert c.async_tp_enabled is True
     assert c.failslow_zscore_threshold == 3.0
     assert c.failslow_window_steps == 50
+    assert c.auto_tune_runtime is False
+    assert c.auto_tune_failslow_zscore_min == 1.5
+    assert c.auto_tune_failslow_zscore_max == 6.0
+    assert c.auto_tune_grace_window_max_ms == 10_000
     assert c.rack_aware is True
     assert c.sideband_addr == "tcp://0.0.0.0:51900"
     assert c.sideband_peers == ()
@@ -59,6 +63,19 @@ def test_failslow_validation():
         MendConfig(failslow_min_samples=1)
     with pytest.raises(ValueError, match="cannot exceed"):
         MendConfig(failslow_window_steps=10, failslow_min_samples=20)
+
+
+def test_runtime_autotuner_validation():
+    MendConfig(auto_tune_runtime=True)
+    with pytest.raises(ValueError, match="auto_tune_failslow_zscore_min"):
+        MendConfig(auto_tune_failslow_zscore_min=0.0)
+    with pytest.raises(ValueError, match="auto_tune_failslow_zscore_max"):
+        MendConfig(
+            auto_tune_failslow_zscore_min=3.0,
+            auto_tune_failslow_zscore_max=2.0,
+        )
+    with pytest.raises(ValueError, match="auto_tune_grace_window_max_ms"):
+        MendConfig(auto_tune_grace_window_max_ms=-1)
 
 
 def test_sideband_addr_validation():
