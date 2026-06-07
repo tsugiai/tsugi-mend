@@ -170,6 +170,58 @@ class MendConfig:
     failslow_min_samples: int = 10
 
     # ------------------------------------------------------------------
+    # Online runtime autotuner (fail-slow detection sensitivity +
+    # grace-window wait). Published basis: Guard (arXiv:2605.17879,
+    # online performance monitoring / node health) for the
+    # detection-threshold adaptation, and "From Detection to Recovery"
+    # (arXiv:2605.09370, operational analysis) for the recovery-wait
+    # heuristic. Engineering only; the upstream papers' headline numbers
+    # are NOT reproduced here as tsugi-mend results.
+    # ------------------------------------------------------------------
+    # Master switch. When True, the runtime continuously adapts (past a
+    # warmup window) the effective fail-slow z-score threshold and the
+    # effective grace-window wall-clock wait from the observed per-rank
+    # step-time stream. Default OFF so default-mode behavior is
+    # byte-for-byte unchanged.
+    #
+    # Bit-exact-safe by construction: (a) the detection threshold is
+    # observe-only (no mitigation/exclusion is wired off the detector
+    # here), so adapting it changes only which steps are FLAGGED in the
+    # diagnostic stream, never any tensor value; (b) the grace window is a
+    # wall-clock wait only -- in default mode the syncer waits for the same
+    # fragments regardless of the wait length, so adapting it changes
+    # timing/overlap, never WHICH fragments merge or the apply boundary.
+    # The autotuner deliberately does NOT online-adapt the merge cadence
+    # (sync_period_steps / momentum cadence / apply lag); doing so would
+    # make a paired baseline-vs-sdk run diverge (their step times differ).
+    auto_tune_runtime: bool = False
+    # Rolling window of recent step-time samples the autotuner's control
+    # law statistics (CoV, peak ratio) are computed over.
+    auto_tune_runtime_window_steps: int = 50
+    # Minimum window fill before the autotuner starts adapting. Until this
+    # many samples accumulate the effective values stay at the static
+    # config baseline (failslow_zscore_threshold / grace_window_ms).
+    auto_tune_runtime_min_samples: int = 10
+    # Bounds on the adapted z-score threshold. The detector's static
+    # failslow_zscore_threshold is the floor the clean-cluster case relaxes
+    # toward; the autotuner raises the threshold up to the max under high
+    # observed jitter.
+    auto_tune_zscore_min: float = 2.0
+    auto_tune_zscore_max: float = 8.0
+    # Bounds (ms) on the adapted grace-window wait. The static
+    # grace_window_ms sits inside this range; the autotuner widens up to
+    # the max under a sustained straggler and narrows back toward baseline
+    # when clean.
+    auto_tune_grace_window_min_ms: int = 0
+    auto_tune_grace_window_max_ms: int = 10_000
+    # Control-law gains. cov_gain scales how strongly observed jitter
+    # (coefficient of variation) raises the z-score threshold; grace_gain
+    # scales how strongly a sustained straggler (recent peak/median ratio)
+    # widens the grace window. Both must be >= 0.
+    auto_tune_cov_gain: float = 4.0
+    auto_tune_grace_gain: float = 1.0
+
+    # ------------------------------------------------------------------
     # Rack-aware topology
     # ------------------------------------------------------------------
     # Whether the runtime should attempt rack-aware DP-last mapping.
@@ -329,4 +381,48 @@ class MendConfig:
                 f"must be <= sync_period_steps ({self.sync_period_steps}). "
                 f"The static sync_period_steps is the upper bound on the "
                 f"auto-tuned N; the lower bound cannot exceed it."
+            )
+        if self.auto_tune_runtime_window_steps < 2:
+            raise ValueError(
+                f"auto_tune_runtime_window_steps must be >= 2; "
+                f"got {self.auto_tune_runtime_window_steps}"
+            )
+        if self.auto_tune_runtime_min_samples < 2:
+            raise ValueError(
+                f"auto_tune_runtime_min_samples must be >= 2; "
+                f"got {self.auto_tune_runtime_min_samples}"
+            )
+        if self.auto_tune_runtime_min_samples > self.auto_tune_runtime_window_steps:
+            raise ValueError(
+                f"auto_tune_runtime_min_samples ({self.auto_tune_runtime_min_samples}) "
+                f"cannot exceed auto_tune_runtime_window_steps "
+                f"({self.auto_tune_runtime_window_steps})"
+            )
+        if self.auto_tune_zscore_min <= 0:
+            raise ValueError(
+                f"auto_tune_zscore_min must be > 0; got {self.auto_tune_zscore_min}"
+            )
+        if self.auto_tune_zscore_max < self.auto_tune_zscore_min:
+            raise ValueError(
+                f"auto_tune_zscore_max ({self.auto_tune_zscore_max}) must be >= "
+                f"auto_tune_zscore_min ({self.auto_tune_zscore_min})"
+            )
+        if self.auto_tune_grace_window_min_ms < 0:
+            raise ValueError(
+                f"auto_tune_grace_window_min_ms must be >= 0; "
+                f"got {self.auto_tune_grace_window_min_ms}"
+            )
+        if self.auto_tune_grace_window_max_ms < self.auto_tune_grace_window_min_ms:
+            raise ValueError(
+                f"auto_tune_grace_window_max_ms ({self.auto_tune_grace_window_max_ms}) "
+                f"must be >= auto_tune_grace_window_min_ms "
+                f"({self.auto_tune_grace_window_min_ms})"
+            )
+        if self.auto_tune_cov_gain < 0:
+            raise ValueError(
+                f"auto_tune_cov_gain must be >= 0; got {self.auto_tune_cov_gain}"
+            )
+        if self.auto_tune_grace_gain < 0:
+            raise ValueError(
+                f"auto_tune_grace_gain must be >= 0; got {self.auto_tune_grace_gain}"
             )

@@ -87,3 +87,43 @@ def test_sideband_tls_requires_ca_file():
             sideband_tls_certfile="server.crt",
             sideband_tls_keyfile="server.key",
         )
+
+
+def test_auto_tune_runtime_defaults_off():
+    c = MendConfig()
+    assert c.auto_tune_runtime is False
+    assert c.auto_tune_runtime_window_steps == 50
+    assert c.auto_tune_runtime_min_samples == 10
+    assert c.auto_tune_zscore_min == 2.0
+    assert c.auto_tune_zscore_max == 8.0
+    assert c.auto_tune_grace_window_min_ms == 0
+    assert c.auto_tune_grace_window_max_ms == 10_000
+    assert c.auto_tune_cov_gain == 4.0
+    assert c.auto_tune_grace_gain == 1.0
+
+
+def test_auto_tune_runtime_validation():
+    with pytest.raises(ValueError, match="auto_tune_runtime_window_steps"):
+        MendConfig(auto_tune_runtime_window_steps=1)
+    with pytest.raises(ValueError, match="auto_tune_runtime_min_samples"):
+        MendConfig(auto_tune_runtime_min_samples=1)
+    with pytest.raises(ValueError, match="cannot exceed"):
+        MendConfig(
+            auto_tune_runtime_window_steps=10,
+            auto_tune_runtime_min_samples=20,
+        )
+    with pytest.raises(ValueError, match="auto_tune_zscore_min"):
+        MendConfig(auto_tune_zscore_min=0)
+    with pytest.raises(ValueError, match="auto_tune_zscore_max"):
+        MendConfig(auto_tune_zscore_min=5.0, auto_tune_zscore_max=3.0)
+    with pytest.raises(ValueError, match="auto_tune_grace_window_min_ms"):
+        MendConfig(auto_tune_grace_window_min_ms=-1)
+    with pytest.raises(ValueError, match="auto_tune_grace_window_max_ms"):
+        MendConfig(
+            auto_tune_grace_window_min_ms=5000,
+            auto_tune_grace_window_max_ms=1000,
+        )
+    with pytest.raises(ValueError, match="auto_tune_cov_gain"):
+        MendConfig(auto_tune_cov_gain=-1.0)
+    with pytest.raises(ValueError, match="auto_tune_grace_gain"):
+        MendConfig(auto_tune_grace_gain=-1.0)

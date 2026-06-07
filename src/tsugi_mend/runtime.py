@@ -31,6 +31,7 @@ from typing import Optional
 import torch.nn as nn
 
 from tsugi_mend.async_tp import enable_async_tp
+from tsugi_mend.autotuner import RuntimeAutotuner
 from tsugi_mend.concurrent import ConcurrentOuterStep, FragmentProvider
 from tsugi_mend.config import MendConfig
 from tsugi_mend.desync_optimizer import DesynchronizedSyncSchedule, SyncSchedule
@@ -109,6 +110,30 @@ class _MaxRuntime:
         self._auto_tune_decided: bool = not config.auto_tune_sync_period
         self._warmup_step_times_ms: list[float] = []
 
+        # Online runtime autotuner. Continuously (past a warmup window)
+        # adapts the fail-slow detection sensitivity (the detector's
+        # z-score threshold, which is OBSERVE-ONLY here -- numerically
+        # inert) and the syncer's grace-window WALL-CLOCK wait, from the
+        # observed per-rank step-time stream. Allocated only when
+        # config.auto_tune_runtime is True so the default path is a no-op
+        # and default-mode behavior is byte-for-byte unchanged. This does
+        # NOT online-adapt the merge cadence (that would break paired
+        # baseline==sdk bit-exactness; see autotuner.py).
+        self._autotuner: Optional[RuntimeAutotuner] = None
+        if config.auto_tune_runtime:
+            self._autotuner = RuntimeAutotuner(
+                base_zscore_threshold=config.failslow_zscore_threshold,
+                base_grace_window_ms=config.grace_window_ms,
+                window_steps=config.auto_tune_runtime_window_steps,
+                min_samples=config.auto_tune_runtime_min_samples,
+                zscore_min=config.auto_tune_zscore_min,
+                zscore_max=config.auto_tune_zscore_max,
+                grace_min_ms=config.auto_tune_grace_window_min_ms,
+                grace_max_ms=config.auto_tune_grace_window_max_ms,
+                cov_gain=config.auto_tune_cov_gain,
+                grace_gain=config.auto_tune_grace_gain,
+            )
+
     def start(self, model: nn.Module) -> None:
         if self.config.async_tp_enabled:
             self.async_tp_active = enable_async_tp(model)
@@ -156,6 +181,7 @@ class _MaxRuntime:
             hostname=self.hostname,
             async_tp_active=self.async_tp_active,
             concurrent_outer_step_active=self._concurrent_orch is not None,
+            auto_tune_runtime_active=self._autotuner is not None,
             topology_method=self.topology.detection_method,
             n_racks=self.topology.n_racks(),
         )
@@ -196,14 +222,33 @@ class _MaxRuntime:
                 health_bit=True,
             )
 
-    def step_end(self, step: int) -> None:
+    def step_end(self, step: int, step_time_ms_override: Optional[float] = None) -> None:
         """Hook the runtime expects at the bottom of each optimizer step.
-        Observes the step time, runs fail-slow detection, emits
-        diagnostics."""
-        if self._step_start_s is None:
-            return
-        step_time_ms = (time.monotonic() - self._step_start_s) * 1000.0
-        self._step_start_s = None
+        Observes the step time, runs the online autotuner (if enabled),
+        runs fail-slow detection, emits diagnostics.
+
+        `step_time_ms_override` is a test/benchmark seam: when provided it
+        is used as the step duration instead of the measured wall clock, so
+        the autotuner's adaptation can be exercised deterministically with a
+        synthetic step-time stream. Production callers leave it None and the
+        runtime measures the wall clock between step_begin and step_end."""
+        if step_time_ms_override is not None:
+            step_time_ms = float(step_time_ms_override)
+            self._step_start_s = None
+        else:
+            if self._step_start_s is None:
+                return
+            step_time_ms = (time.monotonic() - self._step_start_s) * 1000.0
+            self._step_start_s = None
+        # Online autotuner runs BEFORE the detector observes this step so
+        # the detection decision for the current step reflects the adapted
+        # (observe-only) threshold, and the syncer's wall-clock grace window
+        # is updated for the next outer round. Numerically inert: the
+        # threshold only flips a diagnostic flag, and the grace window is a
+        # wall-clock wait that never changes which fragments merge or the
+        # apply boundary.
+        if self._autotuner is not None:
+            self._run_autotuner(step, step_time_ms)
         decision = self.failslow.observe(self.rank_id, step_time_ms)
         if decision.is_slow:
             self.diagnostics.emit(
@@ -227,6 +272,56 @@ class _MaxRuntime:
             self._warmup_step_times_ms.append(step_time_ms)
             if len(self._warmup_step_times_ms) >= self.config.auto_tune_sync_period_warmup_steps:
                 self._decide_auto_tune(step)
+
+    def _run_autotuner(self, step: int, step_time_ms: float) -> None:
+        """Feed one step time to the online autotuner and apply its
+        effective values.
+
+        Applies the adapted z-score threshold to the (observe-only)
+        fail-slow detector and the adapted grace-window wait to the syncer.
+        Both are numerically inert / wall-clock-only; neither changes the
+        merge math, the fragment set, or the apply boundary, so paired
+        baseline==sdk bit-exactness is preserved. Emits a diagnostic only on
+        steps where an effective value actually changes, to keep the
+        diagnostic stream readable."""
+        assert self._autotuner is not None
+        prev_z = self._autotuner.effective_zscore_threshold
+        prev_g = self._autotuner.effective_grace_window_ms
+        d = self._autotuner.observe(step_time_ms)
+        # Apply the effective values. The detector reads its threshold live
+        # in observe(); the syncer reads grace_window_ms live in tick() and
+        # the orchestrator reads it when computing its deadline.
+        self.failslow.zscore_threshold = d.effective_zscore_threshold
+        self.syncer.grace_window_ms = d.effective_grace_window_ms
+        if d.adapted and (
+            d.effective_zscore_threshold != prev_z
+            or d.effective_grace_window_ms != prev_g
+        ):
+            self.diagnostics.emit(
+                "auto_tune_runtime_decision",
+                step=step,
+                rank_id=self.rank_id,
+                step_time_ms=step_time_ms,
+                observed_cov=d.observed_cov,
+                observed_peak_ratio=d.observed_peak_ratio,
+                effective_zscore_threshold=d.effective_zscore_threshold,
+                effective_grace_window_ms=d.effective_grace_window_ms,
+                window_size=d.window_size,
+            )
+
+    def effective_failslow_zscore_threshold(self) -> float:
+        """Current z-score threshold the fail-slow detector uses. Equals
+        config.failslow_zscore_threshold when the runtime autotuner is
+        disabled or still in its warmup window; equals the online-adapted
+        value once the autotuner has started adapting."""
+        return self.failslow.zscore_threshold
+
+    def effective_grace_window_ms(self) -> int:
+        """Current wall-clock grace-window wait the syncer uses. Equals
+        config.grace_window_ms when the runtime autotuner is disabled or
+        still in its warmup window; equals the online-adapted value once
+        the autotuner has started adapting."""
+        return self.syncer.grace_window_ms
 
     def schedule_for(self, step: int) -> SyncSchedule:
         """Convenience pass-through to the DES-LOC schedule."""
