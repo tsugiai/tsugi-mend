@@ -50,6 +50,13 @@ def test_des_loc_M_ge_N():
         MendConfig(sync_period_steps=128, momentum_sync_period_steps=64)
 
 
+def test_outer_step_compression_mode_accepts_sparse():
+    for mode in ("none", "int8", "powersgd", "sparse"):
+        MendConfig(outer_step_compression_mode=mode)
+    with pytest.raises(ValueError, match="outer_step_compression_mode"):
+        MendConfig(outer_step_compression_mode="lossy-sparse")
+
+
 def test_failslow_validation():
     with pytest.raises(ValueError, match="failslow_window_steps"):
         MendConfig(failslow_window_steps=1)
