@@ -118,8 +118,11 @@ class MendConfig:
     # symmetric INT8 quantization (lossy; not convergence-preserving
     # without error feedback). "powersgd" applies rank-r low-rank
     # approximation with persistent error-feedback residual (Vogels 2019,
-    # arXiv:1905.13727); convergence-preserving by design. Compression
-    # modes other than "none" are experimental and off by default.
+    # arXiv:1905.13727); convergence-preserving by design. "sparse"
+    # applies a lossless index+value delta codec with dense fallback, so
+    # it preserves exact tensor values but only reduces communication when
+    # the delta is genuinely element-sparse. Compression modes other than
+    # "none" are experimental and off by default.
     outer_step_compression_mode: str = "none"
     # PowerSGD low-rank approximation rank. Higher r reduces compression
     # but improves accuracy. PowerSGD paper recommends r=4 as default.
@@ -354,10 +357,10 @@ class MendConfig:
                 f"'constant', 'bimodal', 'long_tail'; "
                 f"got {self.simulated_merge_delay_distribution!r}"
             )
-        if self.outer_step_compression_mode not in ("none", "int8", "powersgd"):
+        if self.outer_step_compression_mode not in ("none", "int8", "powersgd", "sparse"):
             raise ValueError(
                 f"outer_step_compression_mode must be one of "
-                f"'none', 'int8', 'powersgd'; "
+                f"'none', 'int8', 'powersgd', 'sparse'; "
                 f"got {self.outer_step_compression_mode!r}"
             )
         if self.outer_step_compression_powersgd_rank < 1:

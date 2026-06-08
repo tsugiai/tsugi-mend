@@ -31,6 +31,7 @@
 | `async_tp.enable_async_tp` | PyTorch / TorchTitan async-TP, September 2024 | best-effort enabling of TorchTitan's intra-node async-TP path |
 | `failslow.FailSlowDetector` | FALCON, arXiv:2410.12588 | sliding-window z-score detection of slow ranks |
 | `autotuner.RuntimeAutotuner` | Guard (arXiv:2605.17879) online performance monitoring; "From Detection to Recovery" (arXiv:2605.09370) operational recovery-wait analysis | online (continuous) adaptation of the fail-slow detection threshold and the grace-window wall-clock wait from the observed step-time stream |
+| `compression.apply_compression` | INT8 quantization, PowerSGD (arXiv:1905.13727), SparseRL-Sync (arXiv:2605.07330) | optional outer-step delta transforms; `none` and `sparse` are lossless, while `int8` and `powersgd` are lossy opt-in modes |
 | `topology.detect` | generic engineering | rack classification from NCCL_TOPO_FILE or hostname grouping |
 | `sideband.Sideband` | generic engineering | low-bandwidth TCP heartbeat carrying step-id / vector-clock / queue-depth / health metadata |
 | `diagnostics.DiagnosticsWriter` | generic engineering | append-only JSONL event log |
@@ -63,6 +64,14 @@ None of these mechanisms exercise TsugiCinema's K-Pool LoRA (App. 64/060,315) or
 The effective values and the steps on which they changed are surfaced as `auto_tune_runtime_decision` diagnostic events (and `auto_tune_runtime_active` on `mend_init`), consistent with the existing `failslow_decision` / `auto_tune_sync_period_decided` surfacing.
 
 **Why this preserves bit-exact loss equivalence (both OFF and ON).** The detection threshold is observe-only: the detector's decision is a diagnostic flag, no mitigation/exclusion is wired off it here, so adapting the threshold changes only which steps are flagged, never any tensor value. The grace window is a wall-clock wait only: in default (lossless) mode the syncer waits for the same fragments regardless of the wait length, and the merged delta is the token-weighted merge of the same fragment set applied at the same logical boundary, so adapting the wait changes timing/overlap, never which fragments merge or the apply boundary. The autotuner deliberately does **not** online-adapt the merge cadence (`sync_period_steps` / momentum cadence / apply lag): a paired baseline-vs-sdk run has different step times on the two paths (the SDK overlaps the merge), so adapting cadence from measured step times would make the two paths choose different cadences and break bit-exactness. (Rank exclusion / fail-slow mitigation and outer-momentum restarting are separate, deferred concerns and are not part of this autotuner.)
+
+## Optional compression modes
+
+`MendConfig.outer_step_compression_mode` defaults to `none`, which clones the dense delta and preserves the established bit-exact path. `int8` and `powersgd` remain lossy experimental modes and are off by default.
+
+The `sparse` mode is different: it is lossless. Each tensor is encoded as flattened int64 indices plus exact values only when that sparse payload is estimated to be smaller than the dense tensor payload; otherwise it falls back to dense. Decoding reconstructs the original dense tensor bit-for-bit before merge, including negative zero and non-finite values.
+
+This mode only helps when the transmitted delta is genuinely element-sparse, such as adapter-heavy or sparse-update regimes. The default DiLoCo-style `params_delta` after many inner optimizer steps is typically dense, so the sparse codec is expected to choose dense fallback there rather than reduce communication.
 
 ## File-by-file reading order
 

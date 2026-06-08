@@ -7,7 +7,7 @@ transform applied to the params_delta before merge. The synchronous
 reducer path and the orchestrator path both pass through this hook so
 the comparison stays apples-to-apples.
 
-This module ships THREE compression schemes:
+This module ships FOUR compression schemes:
 
 1. INT8 quantization (lossy, simple): per-tensor symmetric quantization
    followed by dequantization. Fast, framework-independent, no extra
@@ -25,7 +25,14 @@ This module ships THREE compression schemes:
    the GraceWindowSyncer fragment merge path. We implement the
    minimal-state PowerSGD primitive in this module instead.
 
-3. None (default; lossless): pass-through. Preserves the bit-exact-
+3. Lossless sparse delta encoding: non-zero elements are represented as
+   flattened int64 indices plus exact values, then decoded back to a
+   dense tensor before merge. The sparse representation is used only
+   when its estimated payload is smaller than dense, so dense DiLoCo
+   deltas fall back to the dense path instead of growing on the wire.
+   This is useful only in genuinely sparse-update regimes.
+
+4. None (default; lossless): pass-through. Preserves the bit-exact-
    loss-equivalence anchor.
 
 The PowerSGD implementation here is a single-iteration low-rank
@@ -58,9 +65,10 @@ Usage:
     out0 = powersgd_compress_delta(tensors[0], state=state, key="layer.0.q")
 
 The MendConfig.outer_step_compression_mode knob ("none" | "int8" |
-"powersgd") selects which transform the runtime applies inside the
-default fragment provider. Default "none" preserves bit-exact loss
-equivalence with the vanilla baseline.
+"powersgd" | "sparse") selects which transform the runtime applies
+inside the default fragment provider. Default "none" preserves bit-exact
+loss equivalence with the vanilla baseline. "sparse" is also lossless,
+but its communication benefit is conditional on element-sparse deltas.
 """
 from __future__ import annotations
 
@@ -71,7 +79,33 @@ import torch
 from torch import Tensor
 
 
-CompressionMode = Literal["none", "int8", "powersgd"]
+CompressionMode = Literal["none", "int8", "powersgd", "sparse"]
+SparseDeltaRepresentation = Literal["dense", "sparse"]
+_INT64_INDEX_BYTES = 8
+
+
+@dataclass(frozen=True)
+class SparseDeltaPayload:
+    """Wire-shape description for a lossless sparse-delta payload.
+
+    `representation` is the selected transmission shape after the break-even
+    check. For "dense", `dense` carries the tensor and `indices` / `values`
+    are None. For "sparse", `indices` are flattened int64 positions and
+    `values` are exact tensor values; `dense` is None. `estimated_bytes` is
+    the selected representation's data-buffer estimate, excluding metadata
+    common to both paths such as shape and dtype.
+    """
+
+    representation: SparseDeltaRepresentation
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    nonzero_elements: int
+    dense_bytes: int
+    sparse_bytes: int
+    estimated_bytes: int
+    dense: Tensor | None = None
+    indices: Tensor | None = None
+    values: Tensor | None = None
 
 
 @dataclass
@@ -235,6 +269,96 @@ def int8_quantize_delta(tensor: Tensor) -> Tensor:
     return dequantized.to(orig_dtype)
 
 
+def _bitwise_nonzero_mask(tensor: Tensor) -> Tensor:
+    """Return a flat mask for elements whose raw byte pattern is not zero.
+
+    Value-level `tensor != 0` would drop IEEE-754 negative zero. Sparse delta
+    sync must preserve exact bits, so the mask is computed over the raw bytes
+    of each element instead.
+    """
+    if tensor.numel() == 0:
+        return torch.empty(0, dtype=torch.bool, device=tensor.device)
+    element_size = tensor.element_size()
+    byte_view = tensor.detach().contiguous().view(torch.uint8)
+    per_element = byte_view.reshape(tensor.numel(), element_size)
+    return per_element.ne(0).any(dim=1)
+
+
+def _dense_payload_bytes(tensor: Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _sparse_payload_bytes(tensor: Tensor, nonzero_elements: int) -> int:
+    # Flattened int64 index per changed element plus the exact dtype value.
+    return int(nonzero_elements * (_INT64_INDEX_BYTES + tensor.element_size()))
+
+
+def sparse_delta_encode(tensor: Tensor) -> SparseDeltaPayload:
+    """Encode a delta tensor with a lossless sparse representation when useful.
+
+    Non-zero means "raw byte pattern differs from all-zero", not value-level
+    inequality. That preserves negative zero and all finite or non-finite
+    values exactly. Dense fallback is selected whenever the estimated sparse
+    index+value data payload would be greater than or equal to the dense tensor
+    payload.
+    """
+    detached = tensor.detach().contiguous()
+    flat = detached.reshape(-1)
+    mask = _bitwise_nonzero_mask(detached)
+    indices = mask.nonzero(as_tuple=False).reshape(-1).to(dtype=torch.int64)
+    nonzero_elements = int(indices.numel())
+    dense_bytes = _dense_payload_bytes(detached)
+    sparse_bytes = _sparse_payload_bytes(detached, nonzero_elements)
+    shape = tuple(detached.shape)
+    if sparse_bytes < dense_bytes:
+        return SparseDeltaPayload(
+            representation="sparse",
+            shape=shape,
+            dtype=detached.dtype,
+            nonzero_elements=nonzero_elements,
+            dense_bytes=dense_bytes,
+            sparse_bytes=sparse_bytes,
+            estimated_bytes=sparse_bytes,
+            indices=indices,
+            values=flat.index_select(0, indices).clone(),
+        )
+    return SparseDeltaPayload(
+        representation="dense",
+        shape=shape,
+        dtype=detached.dtype,
+        nonzero_elements=nonzero_elements,
+        dense_bytes=dense_bytes,
+        sparse_bytes=sparse_bytes,
+        estimated_bytes=dense_bytes,
+        dense=detached.clone(),
+    )
+
+
+def sparse_delta_decode(payload: SparseDeltaPayload) -> Tensor:
+    """Decode a `SparseDeltaPayload` back to its exact dense tensor."""
+    if payload.representation == "dense":
+        if payload.dense is None:
+            raise ValueError("dense sparse-delta payload is missing dense tensor")
+        return payload.dense.detach().clone().reshape(payload.shape)
+    if payload.representation == "sparse":
+        if payload.indices is None or payload.values is None:
+            raise ValueError("sparse sparse-delta payload is missing indices or values")
+        out = torch.zeros(payload.shape, dtype=payload.dtype, device=payload.values.device)
+        if payload.indices.numel() > 0:
+            out.reshape(-1).index_copy_(
+                0,
+                payload.indices.to(device=payload.values.device),
+                payload.values,
+            )
+        return out
+    raise ValueError(f"unknown sparse-delta representation {payload.representation!r}")
+
+
+def sparse_compress_delta(tensor: Tensor) -> Tensor:
+    """Lossless sparse encode/decode transform for the compression hook."""
+    return sparse_delta_decode(sparse_delta_encode(tensor))
+
+
 def apply_compression(
     tensors: list[Tensor],
     mode: CompressionMode = "none",
@@ -262,15 +386,22 @@ def apply_compression(
             powersgd_compress_delta(t, state=powersgd_state, key=f"{key_prefix}.{i}")
             for i, t in enumerate(tensors)
         ]
+    if mode == "sparse":
+        return [sparse_compress_delta(t) for t in tensors]
     raise ValueError(
-        f"unknown compression mode {mode!r}; expected one of: none, int8, powersgd"
+        f"unknown compression mode {mode!r}; expected one of: none, int8, powersgd, sparse"
     )
 
 
 __all__ = [
     "CompressionMode",
     "PowerSGDState",
+    "SparseDeltaPayload",
+    "SparseDeltaRepresentation",
     "apply_compression",
     "int8_quantize_delta",
     "powersgd_compress_delta",
+    "sparse_compress_delta",
+    "sparse_delta_decode",
+    "sparse_delta_encode",
 ]

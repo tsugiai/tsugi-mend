@@ -9,7 +9,17 @@ from tsugi_mend.compression import (
     apply_compression,
     int8_quantize_delta,
     powersgd_compress_delta,
+    sparse_delta_decode,
+    sparse_delta_encode,
 )
+
+
+def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    actual_bytes = actual.detach().contiguous().view(torch.uint8)
+    expected_bytes = expected.detach().contiguous().view(torch.uint8)
+    assert torch.equal(actual_bytes, expected_bytes)
 
 
 def test_int8_quantize_preserves_shape_and_dtype():
@@ -73,6 +83,68 @@ def test_apply_compression_int8_round_trip():
 def test_apply_compression_rejects_unknown_mode():
     with pytest.raises(ValueError, match="unknown compression mode"):
         apply_compression([torch.randn(4)], mode="powerful")  # type: ignore[arg-type]
+
+
+# ----------------------------------------------------------------------
+# Lossless sparse delta codec
+# ----------------------------------------------------------------------
+
+
+def test_sparse_delta_round_trips_exact_cases():
+    dense = torch.arange(1, 65, dtype=torch.float32).reshape(8, 8)
+
+    sparse = torch.zeros(10_000, dtype=torch.float32)
+    sparse[::100] = torch.linspace(1.0, 100.0, 100)
+
+    all_zero = torch.zeros(512, dtype=torch.float32)
+    all_nonzero = torch.arange(1, 513, dtype=torch.float32)
+
+    negative_zero = torch.zeros(512, dtype=torch.float32)
+    negative_zero[17] = -0.0
+    negative_zero[31] = 1.25
+
+    non_finite = torch.zeros(512, dtype=torch.float32)
+    non_finite[3] = float("inf")
+    non_finite[4] = float("-inf")
+    non_finite[5] = float("nan")
+
+    for tensor in (dense, sparse, all_zero, all_nonzero, negative_zero, non_finite):
+        payload = sparse_delta_encode(tensor)
+        decoded = sparse_delta_decode(payload)
+        _assert_same_bits(decoded, tensor)
+
+
+def test_sparse_delta_reports_dense_fallback_and_sparse_savings():
+    dense = torch.ones(1024, dtype=torch.float32)
+    dense_payload = sparse_delta_encode(dense)
+    assert dense_payload.representation == "dense"
+    assert dense_payload.estimated_bytes == dense_payload.dense_bytes
+    assert dense_payload.sparse_bytes > dense_payload.dense_bytes
+
+    sparse = torch.zeros(10_000, dtype=torch.float32)
+    sparse[::100] = 1.0
+    sparse_payload = sparse_delta_encode(sparse)
+    assert sparse_payload.representation == "sparse"
+    assert sparse_payload.nonzero_elements == 100
+    assert sparse_payload.estimated_bytes == sparse_payload.sparse_bytes
+    assert sparse_payload.sparse_bytes < sparse_payload.dense_bytes
+
+
+def test_apply_compression_sparse_is_bit_exact_to_none_path():
+    sparse = torch.zeros(4096, dtype=torch.float32)
+    sparse[::200] = torch.arange(21, dtype=torch.float32)
+    tensors = [
+        torch.randn(16, 16),
+        sparse,
+        torch.tensor([0.0, -0.0, float("inf"), float("-inf")], dtype=torch.float32),
+    ]
+
+    none_path = apply_compression(tensors, mode="none")
+    sparse_path = apply_compression(tensors, mode="sparse")
+
+    assert len(sparse_path) == len(none_path)
+    for sparse_tensor, dense_tensor in zip(sparse_path, none_path):
+        _assert_same_bits(sparse_tensor, dense_tensor)
 
 
 # ----------------------------------------------------------------------
