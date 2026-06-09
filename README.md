@@ -22,7 +22,7 @@ Public-art references and 0.1.x implementation status:
 - **DES-LOC / Local Adam** (Iacob et al., arXiv:2505.22549, May 2025; ICLR 2026): desynchronized synchronization-period components are present, but moment synchronization is not automatically wired into `mend_init` in 0.1.x.
 - **Async tensor parallelism** (PyTorch / TorchTitan, September 2024): treated as an integration component/configuration point, not automatically installed by `mend_init` in 0.1.x.
 - **FALCON fail-slow detection** (arXiv:2410.12588, October 2024): the runtime observes step times and can emit detection diagnostics; FALCON-style quorum exclusion/mitigation is not wired in 0.1.x.
-- **Gradient compression** (`none`, `int8`, `powersgd`): primitives and config validation are present; the default path is lossless `none`, and compression is not invoked by the 0.1.x runtime outer-step path.
+- **Gradient compression** (`none`, `int8`, `powersgd`, `sparse`): primitives and config validation are present; the default path is lossless `none` (`sparse` is also lossless, with a dense fallback), and compression is not invoked by the 0.1.x runtime outer-step path.
 
 The SDK keeps intra-rack TP / CP / PP / FSDP collectives unchanged. In 0.1.x,
 the public runtime exercises the reducer plus concurrent outer-step overlap;
@@ -137,7 +137,7 @@ See [`docs/multinode.md`](docs/multinode.md) for the multi-node launch walkthrou
 
 ## Status
 
-**Pre-Alpha (0.1.1).** APIs are stabilizing and may change before v1.0. Published to PyPI as `tsugi-mend`; also reachable through the unified `tsugi` meta-package as `tsugi.mend`. The staged validation (Stage A unit/integration through cross-network production-fabric runs) all passed under the protocol above; the real-fabric Hopper cross-network result is point-estimate closed (n=1), with an n=3 CI pending.
+**Pre-Alpha (0.1.3).** APIs are stabilizing and may change before v1.0. Published to PyPI as `tsugi-mend`; also reachable through the unified `tsugi` meta-package as `tsugi.mend`. The staged validation (Stage A unit/integration through cross-network production-fabric runs) all passed under the protocol above; the real-fabric Hopper cross-network result is point-estimate closed (n=1), with an n=3 CI pending.
 
 ## Quickstart
 
