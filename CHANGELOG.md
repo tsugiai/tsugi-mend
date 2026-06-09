@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- `GraceWindowSyncer.start_round` can now accept an expected learner set for
+  multi-rack rounds. When every expected non-fail-slow learner reports after
+  quorum, the round finalizes immediately with `reason="all_present"` instead
+  of waiting out the remaining grace window; grace-expired rounds now report
+  `learners_absent` diagnostics. The default `expected=None` path preserves the
+  existing quorum plus grace-window behavior.
+
 ## [0.1.3] - 2026-06-09
 
 ### Added

@@ -122,6 +122,8 @@ def test_syncer_K_satisfied_then_grace_window_then_fire():
     assert out is not None
     assert out.round_id == 7
     assert sorted(out.learners_merged) == ["a", "b"]
+    assert out.learners_absent == []
+    assert out.reason == "grace_expired"
     assert torch.allclose(out.merged_delta[0], torch.tensor([2.0]))
 
 
@@ -144,6 +146,8 @@ def test_syncer_third_learner_arrives_within_grace_is_included():
     out = sync.tick()
     assert out is not None
     assert sorted(out.learners_merged) == ["a", "b", "c"]
+    assert out.learners_absent == []
+    assert out.reason == "grace_expired"
     # Equal-tokens average of [1, 3, 5] = 3.0
     assert torch.allclose(out.merged_delta[0], torch.tensor([3.0]))
 
@@ -175,6 +179,7 @@ def test_syncer_failslow_exclusion_drops_submissions():
     assert out is not None
     assert "slow_rank" not in out.learners_merged
     assert "slow_rank" in out.learners_excluded
+    assert out.learners_absent == []
 
 
 def test_syncer_ignores_stale_round_fragments():
@@ -183,6 +188,110 @@ def test_syncer_ignores_stale_round_fragments():
     # Fragment from round 9 is stale; reject.
     assert sync.submit(_mk_fragment("a", 9, [1.0], tokens=100)) is None
     assert sync.submit(_mk_fragment("a", 11, [1.0], tokens=100)) is None
+
+
+def test_syncer_expected_three_learners_early_finalizes_all_present():
+    clock = FakeClock()
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=1000,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=20, expected_learner_ids={"a", "b", "c"})
+
+    assert sync.submit(_mk_fragment("a", 20, [1.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("b", 20, [3.0], tokens=100)) is None
+    clock.advance_ms(100)
+    out = sync.submit(_mk_fragment("c", 20, [5.0], tokens=100))
+
+    assert out is not None
+    assert out.reason == "all_present"
+    assert out.learners_absent == []
+    assert out.learners_excluded == []
+    assert sorted(out.learners_merged) == ["a", "b", "c"]
+    assert torch.allclose(out.merged_delta[0], torch.tensor([3.0]))
+
+
+def test_syncer_expected_four_learners_records_absent_after_grace():
+    clock = FakeClock()
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=21, expected_learner_ids={"a", "b", "c", "d"})
+
+    assert sync.submit(_mk_fragment("a", 21, [1.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("b", 21, [3.0], tokens=100)) is None
+    clock.advance_ms(600)
+    out = sync.tick()
+
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert out.learners_absent == ["c", "d"]
+    assert out.learners_excluded == []
+    assert sorted(out.learners_merged) == ["a", "b"]
+    assert torch.allclose(out.merged_delta[0], torch.tensor([2.0]))
+
+
+def test_syncer_expected_eight_learners_separates_failslow_from_absent():
+    clock = FakeClock()
+    expected = {f"r{i}" for i in range(8)}
+    sync = GraceWindowSyncer(
+        quorum_min_learners=5,
+        grace_window_ms=250,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=22, expected_learner_ids=expected)
+    sync.mark_failslow("r7")
+
+    for idx in range(5):
+        assert (
+            sync.submit(_mk_fragment(f"r{idx}", 22, [float(idx)], tokens=100))
+            is None
+        )
+    clock.advance_ms(300)
+    out = sync.tick()
+
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert out.learners_absent == ["r5", "r6"]
+    assert out.learners_excluded == ["r7"]
+    assert set(out.learners_absent).isdisjoint(out.learners_excluded)
+    assert sorted(out.learners_merged) == ["r0", "r1", "r2", "r3", "r4"]
+    assert torch.allclose(out.merged_delta[0], torch.tensor([2.0]))
+
+
+def test_syncer_rejects_quorum_min_greater_than_total_learners():
+    sync = GraceWindowSyncer(quorum_min_learners=4, grace_window_ms=100)
+    with pytest.raises(ValueError, match="quorum_min_learners cannot exceed"):
+        sync.start_round(round_id=23, expected_learner_ids={"a", "b", "c"})
+    with pytest.raises(ValueError, match="quorum_min_learners cannot exceed"):
+        sync.start_round(round_id=23, total_learners=3)
+
+
+def test_syncer_expected_none_preserves_grace_reason_and_merge():
+    clock = FakeClock()
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=24)
+    assert sync.submit(_mk_fragment("a", 24, [1.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("b", 24, [3.0], tokens=100)) is None
+    clock.advance_ms(600)
+    out = sync.tick()
+
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert out.learners_absent == []
+    assert sorted(out.learners_merged) == ["a", "b"]
+    assert torch.allclose(out.merged_delta[0], torch.tensor([2.0]))
 
 
 def test_syncer_simulated_merge_delay_is_applied():

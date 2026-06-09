@@ -66,7 +66,8 @@ class MergeResult:
     learners_merged: list[str]
     learners_excluded: list[str]
     elapsed_grace_ms: float
-    reason: str  # "quorum_satisfied", "grace_expired", "fail_slow_excluded"
+    reason: str  # "quorum_satisfied", "grace_expired", "all_present"
+    learners_absent: list[str] = field(default_factory=list)
 
 
 def token_weighted_merge(fragments: Iterable[LearnerFragment]) -> list[Tensor]:
@@ -127,6 +128,7 @@ class _SyncerState:
     round_id: int
     fragments: dict[str, LearnerFragment] = field(default_factory=dict)
     failslow_excluded: set[str] = field(default_factory=set)
+    expected_learner_ids: set[str] | None = None
     round_start_s: float = 0.0
     k_satisfied_at_s: Optional[float] = None
 
@@ -196,8 +198,40 @@ class GraceWindowSyncer:
         import random as _random
         self._delay_rng: _random.Random = _random.Random()
 
-    def start_round(self, round_id: int) -> None:
-        self._state = _SyncerState(round_id=round_id, round_start_s=self._clock())
+    def start_round(
+        self,
+        round_id: int,
+        expected_learner_ids: set[str] | None = None,
+        total_learners: int | None = None,
+    ) -> None:
+        expected = (
+            set(expected_learner_ids) if expected_learner_ids is not None else None
+        )
+        expected_total = len(expected) if expected is not None else total_learners
+        if (
+            expected is not None
+            and total_learners is not None
+            and total_learners != len(expected)
+        ):
+            raise ValueError(
+                "total_learners must match expected_learner_ids length; "
+                f"got total_learners={total_learners}, "
+                f"len(expected_learner_ids)={len(expected)}"
+            )
+        if expected_total is not None:
+            if expected_total < 1:
+                raise ValueError(f"total_learners must be >= 1; got {expected_total}")
+            if self.quorum_min > expected_total:
+                raise ValueError(
+                    "quorum_min_learners cannot exceed total_learners; "
+                    f"got quorum_min_learners={self.quorum_min}, "
+                    f"total_learners={expected_total}"
+                )
+        self._state = _SyncerState(
+            round_id=round_id,
+            expected_learner_ids=expected,
+            round_start_s=self._clock(),
+        )
 
     def mark_failslow(self, learner_id: str) -> None:
         """Exclude a learner from this round (FALCON integration point).
@@ -245,6 +279,8 @@ class GraceWindowSyncer:
             return None
         now = self._clock()
         elapsed_ms = (now - self._state.k_satisfied_at_s) * 1000.0
+        if self._all_expected_active_learners_present():
+            return self._finalize(reason="all_present", elapsed_grace_ms=elapsed_ms)
         if elapsed_ms >= self.grace_window_ms:
             return self._finalize(reason="grace_expired", elapsed_grace_ms=elapsed_ms)
         return None
@@ -348,6 +384,26 @@ class GraceWindowSyncer:
             return self._delay_rng.lognormvariate(mu, sigma)
         return float(base)
 
+    def _all_expected_active_learners_present(self) -> bool:
+        assert self._state is not None
+        expected = self._state.expected_learner_ids
+        if expected is None:
+            return False
+        active_expected = expected - self._state.failslow_excluded
+        return active_expected.issubset(self._state.fragments.keys())
+
+    def _learners_absent(self) -> list[str]:
+        assert self._state is not None
+        expected = self._state.expected_learner_ids
+        if expected is None:
+            return []
+        missing = (
+            expected
+            - set(self._state.fragments.keys())
+            - self._state.failslow_excluded
+        )
+        return sorted(missing)
+
     def _finalize(self, reason: str, elapsed_grace_ms: float) -> MergeResult:
         assert self._state is not None
         # Phase 2 Week 1 Day 4-7: optional simulated grace-window wait.
@@ -367,6 +423,7 @@ class GraceWindowSyncer:
             merged_delta=merged,
             learners_merged=sorted(self._state.fragments.keys()),
             learners_excluded=sorted(self._state.failslow_excluded),
+            learners_absent=self._learners_absent(),
             elapsed_grace_ms=elapsed_grace_ms,
             reason=reason,
         )
