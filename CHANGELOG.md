@@ -7,6 +7,42 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-09
+
+### Added
+
+- Lossless sparse-delta compression mode (`outer_step_compression_mode="sparse"`).
+  Encodes a parameter delta as flattened int64 indices plus exact values when
+  that payload would be smaller than the dense tensor, and falls back to dense
+  otherwise, so it never grows the wire and preserves exact tensor bits
+  (including IEEE-754 negative zero, via a raw-byte non-zero mask). Opt-in; the
+  default stays `"none"`. The communication benefit is conditional on genuinely
+  element-sparse deltas (typical dense DiLoCo deltas select the dense fallback).
+  New helpers in `tsugi_mend.compression`: `sparse_delta_encode`,
+  `sparse_delta_decode`, `sparse_compress_delta`, and the `SparseDeltaPayload`
+  dataclass.
+- Online runtime autotuner (`MendConfig.auto_tune_runtime`, default OFF). When
+  enabled, a deterministic, stdlib-only control law adapts the effective
+  fail-slow z-score threshold (from the observed step-time coefficient of
+  variation) and the wall-clock grace-window wait (from the recent peak/median
+  ratio), each clamped to configurable min/max bounds. Bit-exact-safe by
+  construction in default mode: the detector is observe-only and the grace
+  window is a wall-clock wait, so adapting either changes timing/diagnostics
+  only, never which fragments merge or any tensor value. New `tsugi_mend.autotuner`
+  module (`RuntimeAutotuner`, `AutotuneDecision`) plus the `auto_tune_*`
+  `MendConfig` fields (all defaulted).
+- Seeded stall-sweep benchmark harness (`benchmarks/run_stall_sweep.py`) with a
+  per-rank deterministic straggler injector, n>=5 paired trials using a
+  drop-extremes + bootstrap-CI reporting rule, and a per-seed bit-exact loss
+  assertion. Benchmark and docs tooling only; not shipped in the installed wheel.
+
+### Changed
+
+- `outer_step_compression_mode` now accepts `"sparse"` in addition to
+  `"none" | "int8" | "powersgd"`.
+- README version marker updated to 0.1.3; the compression-modes list now
+  includes `sparse`.
+
 ## [0.1.2] - 2026-05-29
 
 ### Added
