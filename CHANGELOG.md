@@ -7,6 +7,29 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- World-size-aware multi-rack reducer for `reducer.GraceWindowSyncer`.
+  `start_round` now accepts optional `expected_learner_ids: set[str] | None`
+  (and `total_learners: int | None`). When the expected learner set is known,
+  the syncer **early-finalizes** the moment every expected, non-fail-slow
+  learner has reported and quorum is met, emitting a new
+  `MergeResult.reason == "all_present"` instead of always waiting out the full
+  grace window. It also records `MergeResult.learners_absent: list[str]` -- the
+  expected learners neither received nor fail-slow-excluded at finalize
+  (disjoint from `learners_merged` and `learners_excluded`). Supplying a known
+  total now rejects `quorum_min_learners > total` with a clear `ValueError`.
+  This closes the documented 3+/4+ rack gap (needless post-quorum latency and
+  no absentee diagnostic) at flat-merge granularity.
+
+### Changed
+
+- `start_round(round_id)` gained two optional keyword parameters
+  (`expected_learner_ids`, `total_learners`), both defaulting to `None`. With
+  both omitted, behavior is **byte-for-byte identical** to before: quorum, then
+  the full grace window, and an empty `learners_absent`. No public symbol was
+  renamed or removed; the change is additive.
+
 ## [0.1.3] - 2026-06-09
 
 ### Added

@@ -52,7 +52,7 @@ None of these mechanisms exercise TsugiCinema's K-Pool LoRA (App. 64/060,315) or
 - Variance-threshold convergence triggers. That belongs to the Infinity patent estate; this SDK uses the grace-window trigger from Decoupled DiLoCo instead.
 - K-of-N adapter routing. That belongs to the K-Pool LoRA patent estate; this SDK does not select a subset of model components per step.
 - Custom C++ NCCL ProcessGroup. Python-level integration is sufficient for the current roadmap.
-- Multi-rack 3+ rack reducer optimization. The current GraceWindowSyncer handles N >= 2 racks; production 4+ rack support is future work.
+- Custom multi-rack reducer *topology* (hierarchical / tree all-reduce across many racks). The GraceWindowSyncer is world-size-aware: pass `start_round(round_id, expected_learner_ids=...)` and it finalizes early the moment every expected, non-fail-slow learner has reported (`MergeResult.reason == "all_present"`) instead of always waiting out the grace window, and it reports which expected learners were absent at finalize (`MergeResult.learners_absent`). What remains future work is a *hierarchical* aggregation topology (e.g. per-rack pre-reduction feeding a top-level merge) for very large rack counts; the current merge is still a single flat token-weighted aggregation.
 
 ## Online runtime autotuner (opt-in, default OFF)
 

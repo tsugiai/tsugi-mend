@@ -320,3 +320,292 @@ def test_syncer_constant_distribution_is_default_behavior():
     assert all(s == 200.0 for s in samples), (
         f"constant distribution emitted non-base values: {set(samples)}"
     )
+
+
+# ----------------------------------------------------------------------
+# World-size-aware multi-rack reducer (ENG-4): expected-learner awareness,
+# early-finalize ("all_present"), and absentee diagnostics. Parametrized
+# over 3, 4, and 8 learners.
+# ----------------------------------------------------------------------
+
+
+# Each learner-count maps to (quorum_min, grace_window_ms) used by the
+# scenario tests. Quorum is set below the total so absences/exclusions can
+# still reach quorum.
+_RACK_COUNTS = [3, 4, 8]
+
+
+def _rack_ids(n: int) -> list[str]:
+    return [f"rack-{i}" for i in range(n)]
+
+
+@pytest.mark.parametrize("n", _RACK_COUNTS)
+def test_multirack_all_present_early_finalizes(n: int):
+    """(a) All expected learners present before the grace window expires
+    -> early-finalize, reason 'all_present', learners_absent == []. The
+    grace window is huge so we know finalize was NOT driven by grace."""
+    clock = FakeClock()
+    ids = _rack_ids(n)
+    sync = GraceWindowSyncer(
+        quorum_min_learners=n - 1,  # quorum below total
+        grace_window_ms=1_000_000,  # effectively never expires
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=3, expected_learner_ids=set(ids))
+    out = None
+    for i, lid in enumerate(ids):
+        # Submit each within a tiny slice of the (enormous) grace window.
+        clock.advance_ms(1.0)
+        result = sync.submit(_mk_fragment(lid, 3, [float(i)], tokens=100))
+        if i < n - 1:
+            assert result is None, f"finalized too early at learner {lid}"
+        else:
+            out = result
+    assert out is not None, "expected early-finalize on the last expected learner"
+    assert out.reason == "all_present"
+    assert out.learners_absent == []
+    assert sorted(out.learners_merged) == sorted(ids)
+    assert out.learners_excluded == []
+    # Merged delta = uniform-token average of 0..n-1.
+    expected_mean = sum(range(n)) / n
+    assert torch.allclose(out.merged_delta[0], torch.tensor([expected_mean]))
+
+
+@pytest.mark.parametrize("n", _RACK_COUNTS)
+def test_multirack_some_absent_grace_expiry_lists_absentees(n: int):
+    """(b) Quorum met but some expected learners never arrive -> the round
+    finalizes on grace expiry, reason 'grace_expired', and the missing
+    learners land in learners_absent."""
+    clock = FakeClock()
+    ids = _rack_ids(n)
+    quorum = n - 1
+    sync = GraceWindowSyncer(
+        quorum_min_learners=quorum,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=4, expected_learner_ids=set(ids))
+    # Exactly `quorum` learners arrive; the last (n - quorum) never do.
+    present = ids[:quorum]
+    absent = ids[quorum:]
+    out = None
+    for lid in present:
+        out = sync.submit(_mk_fragment(lid, 4, [1.0], tokens=100))
+    # Quorum met but not all expected present -> no early finalize yet.
+    assert out is None, "should not early-finalize while expected learners pending"
+    # Grace window expires.
+    clock.advance_ms(600)
+    out = sync.tick()
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert sorted(out.learners_merged) == sorted(present)
+    assert out.learners_absent == sorted(absent)
+    assert out.learners_excluded == []
+
+
+@pytest.mark.parametrize("n", _RACK_COUNTS)
+def test_multirack_failslow_and_absent_are_disjoint(n: int):
+    """(c) Fail-slow + absent interplay: one expected learner is fail-slow-
+    excluded, one expected learner simply never arrives, the rest report.
+    The excluded learner must appear in learners_excluded (not absent), the
+    missing one in learners_absent (not excluded), and the two lists are
+    disjoint. A fail-slow exclusion also counts as 'no longer pending', so
+    if it leaves no other pending learners the round early-finalizes."""
+    clock = FakeClock()
+    ids = _rack_ids(n)
+    # Need at least 3 distinct roles: one excluded, one absent, >=1 present.
+    excluded_id = ids[0]
+    absent_id = ids[1]
+    present_ids = ids[2:]
+    quorum = max(1, len(present_ids))  # present learners can reach quorum
+    sync = GraceWindowSyncer(
+        quorum_min_learners=quorum,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=5, expected_learner_ids=set(ids))
+    sync.mark_failslow(excluded_id)
+    # The fail-slow learner's late submission is ignored.
+    assert sync.submit(_mk_fragment(excluded_id, 5, [99.0], tokens=100)) is None
+    out = None
+    for lid in present_ids:
+        out = sync.submit(_mk_fragment(lid, 5, [2.0], tokens=100))
+    # `absent_id` is the sole remaining pending expected learner, so the round
+    # has NOT early-finalized yet (excluded does not count as present).
+    assert out is None, "absent learner still pending; should not finalize early"
+    # Grace expiry finalizes the round.
+    clock.advance_ms(600)
+    out = sync.tick()
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert out.learners_excluded == [excluded_id]
+    assert out.learners_absent == [absent_id]
+    assert sorted(out.learners_merged) == sorted(present_ids)
+    # Disjointness invariants.
+    excluded_set = set(out.learners_excluded)
+    absent_set = set(out.learners_absent)
+    merged_set = set(out.learners_merged)
+    assert excluded_set.isdisjoint(absent_set)
+    assert excluded_set.isdisjoint(merged_set)
+    assert absent_set.isdisjoint(merged_set)
+
+
+@pytest.mark.parametrize("n", _RACK_COUNTS)
+def test_multirack_failslow_last_pending_triggers_early_finalize(n: int):
+    """(c, complement) When the only remaining pending expected learner is
+    fail-slow-excluded after the rest have reported, a tick early-finalizes
+    with reason 'all_present' and that learner shows up excluded, not absent."""
+    clock = FakeClock()
+    ids = _rack_ids(n)
+    excluded_id = ids[-1]
+    present_ids = ids[:-1]
+    quorum = len(present_ids)
+    sync = GraceWindowSyncer(
+        quorum_min_learners=quorum,
+        grace_window_ms=1_000_000,  # would never expire on its own
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=6, expected_learner_ids=set(ids))
+    out = None
+    for lid in present_ids:
+        clock.advance_ms(1.0)
+        out = sync.submit(_mk_fragment(lid, 6, [1.0], tokens=100))
+    # All-but-one present; the last is still pending -> no finalize.
+    assert out is None
+    # Operator/FALCON gives up on the straggler. Now nothing is pending.
+    sync.mark_failslow(excluded_id)
+    out = sync.tick()
+    assert out is not None
+    assert out.reason == "all_present"
+    assert out.learners_excluded == [excluded_id]
+    assert out.learners_absent == []
+    assert sorted(out.learners_merged) == sorted(present_ids)
+
+
+@pytest.mark.parametrize("n", _RACK_COUNTS)
+def test_multirack_quorum_greater_than_total_raises(n: int):
+    """(d) quorum_min > total must raise a clear ValueError when the total is
+    known (either via expected_learner_ids or total_learners)."""
+    ids = _rack_ids(n)
+    sync = GraceWindowSyncer(quorum_min_learners=n + 1, grace_window_ms=100)
+    with pytest.raises(ValueError, match="cannot exceed"):
+        sync.start_round(round_id=0, expected_learner_ids=set(ids))
+    # Same via total_learners alone.
+    sync2 = GraceWindowSyncer(quorum_min_learners=n + 1, grace_window_ms=100)
+    with pytest.raises(ValueError, match="cannot exceed"):
+        sync2.start_round(round_id=0, total_learners=n)
+
+
+def test_multirack_total_and_expected_must_agree():
+    """(d, complement) Passing both total_learners and expected_learner_ids
+    with disagreeing sizes raises a clear ValueError."""
+    sync = GraceWindowSyncer(quorum_min_learners=1, grace_window_ms=100)
+    with pytest.raises(ValueError, match="must equal"):
+        sync.start_round(
+            round_id=0,
+            expected_learner_ids={"a", "b", "c"},
+            total_learners=4,
+        )
+
+
+def test_multirack_total_learners_does_not_enable_early_finalize():
+    """A bare total_learners count validates quorum but cannot name the
+    expected ids, so early-finalize stays disabled and learners_absent stays
+    empty (count alone is not expected-set awareness)."""
+    clock = FakeClock()
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        clock=clock,
+    )
+    sync.start_round(round_id=8, total_learners=3)
+    sync.submit(_mk_fragment("a", 8, [1.0], tokens=100))
+    out = sync.submit(_mk_fragment("b", 8, [3.0], tokens=100))
+    # Quorum met, but no expected set -> must wait out grace (no early finalize).
+    assert out is None
+    clock.advance_ms(600)
+    out = sync.tick()
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert out.learners_absent == []
+
+
+# ---- regression guard: expected=None is byte-for-byte the old behavior -----
+
+
+def test_multirack_regression_expected_none_identical_merge_and_reason():
+    """(e) REGRESSION GUARD: with expected_learner_ids=None (the default), an
+    existing-style round yields the IDENTICAL merged_delta and reason it does
+    today, plus an empty learners_absent. Mirrors
+    test_syncer_third_learner_arrives_within_grace_is_included exactly, then
+    re-runs the same scenario WITH expected awareness to show the merge math
+    is unchanged and only the reason/diagnostics differ."""
+    # --- legacy path (no expected set) -------------------------------------
+    clock = FakeClock()
+    legacy = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    legacy.start_round(round_id=1)  # no expected_learner_ids
+    legacy.submit(_mk_fragment("a", 1, [1.0], tokens=100))
+    legacy.submit(_mk_fragment("b", 1, [3.0], tokens=100))
+    clock.advance_ms(200)
+    legacy.submit(_mk_fragment("c", 1, [5.0], tokens=100))
+    clock.advance_ms(400)
+    out = legacy.tick()
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert sorted(out.learners_merged) == ["a", "b", "c"]
+    assert out.learners_absent == []  # new field defaults empty in legacy mode
+    legacy_delta = out.merged_delta[0].clone()
+    assert torch.allclose(legacy_delta, torch.tensor([3.0]))
+
+    # --- expected-aware path, same arrivals --------------------------------
+    clock2 = FakeClock()
+    aware = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock2,
+    )
+    aware.start_round(round_id=1, expected_learner_ids={"a", "b", "c"})
+    aware.submit(_mk_fragment("a", 1, [1.0], tokens=100))
+    aware.submit(_mk_fragment("b", 1, [3.0], tokens=100))
+    clock2.advance_ms(200)
+    out2 = aware.submit(_mk_fragment("c", 1, [5.0], tokens=100))
+    # All three expected present + quorum met -> early-finalize immediately
+    # (no need to advance to grace expiry).
+    assert out2 is not None
+    assert out2.reason == "all_present"
+    assert out2.learners_absent == []
+    assert sorted(out2.learners_merged) == ["a", "b", "c"]
+    # The MERGE MATH is identical regardless of WHY/WHEN it fired.
+    assert torch.allclose(out2.merged_delta[0], legacy_delta)
+
+
+def test_multirack_regression_default_round_unchanged_token_weighted():
+    """(e) A token-weighted legacy round (expected=None) still produces the
+    exact token-weighted result, untouched by the new feature path."""
+    clock = FakeClock()
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=2)
+    sync.submit(_mk_fragment("a", 2, [10.0], tokens=300))
+    sync.submit(_mk_fragment("b", 2, [0.0], tokens=100))
+    clock.advance_ms(600)
+    out = sync.tick()
+    assert out is not None
+    assert out.reason == "grace_expired"
+    assert out.learners_absent == []
+    # (300*10 + 100*0)/400 = 7.5
+    assert torch.allclose(out.merged_delta[0], torch.tensor([7.5]))

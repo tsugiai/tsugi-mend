@@ -60,13 +60,36 @@ class LearnerFragment:
 
 @dataclass
 class MergeResult:
-    """Output of one outer-round merge."""
+    """Output of one outer-round merge.
+
+    Attributes:
+        round_id: the outer-round counter this merge belongs to.
+        merged_delta: the token-weighted (or uniform) merged parameter delta.
+        learners_merged: sorted ids of the learners whose fragments merged.
+        learners_excluded: sorted ids of learners fail-slow-excluded this round.
+        elapsed_grace_ms: wall-clock ms elapsed in the grace window since the
+            quorum-satisfaction stamp (0.0 when quorum was forced or the round
+            finalized before the stamp).
+        reason: why the round finalized. One of:
+            - "quorum_satisfied": forced finalize via finalize_on_timeout().
+            - "grace_expired": the grace window elapsed after quorum.
+            - "all_present": every expected, non-fail-slow learner submitted
+              and quorum was met, so the round finalized early without waiting
+              out the remaining grace window. Only possible when the round was
+              started with expected-learner awareness.
+        learners_absent: sorted ids of expected learners that were neither
+            received nor fail-slow-excluded at finalize time. Always empty when
+            the round was started without expected-learner awareness (the
+            default), or when the finalize reason is "all_present". Disjoint
+            from both learners_merged and learners_excluded.
+    """
     round_id: int
     merged_delta: list[Tensor]
     learners_merged: list[str]
     learners_excluded: list[str]
     elapsed_grace_ms: float
-    reason: str  # "quorum_satisfied", "grace_expired", "fail_slow_excluded"
+    reason: str  # "quorum_satisfied", "grace_expired", "all_present"
+    learners_absent: list[str] = field(default_factory=list)
 
 
 def token_weighted_merge(fragments: Iterable[LearnerFragment]) -> list[Tensor]:
@@ -129,6 +152,13 @@ class _SyncerState:
     failslow_excluded: set[str] = field(default_factory=set)
     round_start_s: float = 0.0
     k_satisfied_at_s: Optional[float] = None
+    # Expected-learner awareness for this round (Multi-rack 3+/4+ support).
+    # None means "expected set unknown" -> the syncer falls back to the
+    # quorum-then-full-grace control law (the historical default, preserved
+    # byte-for-byte). When a set is supplied, the syncer can finalize early as
+    # soon as every expected, non-fail-slow learner has reported AND quorum is
+    # met, and it can report which expected learners were absent at finalize.
+    expected_learner_ids: Optional[set[str]] = None
 
 
 class GraceWindowSyncer:
@@ -150,9 +180,21 @@ class GraceWindowSyncer:
             # exhausted incoming without quorum; force decision
             done = syncer.finalize_on_timeout()
 
+    Multi-rack 3+/4+ awareness (optional): pass the round's expected learner
+    ids to start_round so the syncer can finalize early once they have all
+    reported, instead of always waiting out the full grace window, and report
+    which were absent:
+
+        syncer.start_round(round_id=42, expected_learner_ids={"r0", "r1", "r2"})
+        # ... as soon as r0, r1, r2 all submit (and quorum is met), submit()/
+        # tick() returns a MergeResult with reason == "all_present".
+
+    Default (no expected set) behavior is unchanged: quorum, then the full
+    grace window, with an empty `learners_absent`.
+
     The state machine does not block. A real runtime polls
-    `should_finalize()` on a clock; the unit tests drive it
-    deterministically by calling `set_now_s()`.
+    `tick()` on a clock; the unit tests drive it deterministically by calling
+    `set_clock()`.
     """
 
     def __init__(
@@ -196,8 +238,64 @@ class GraceWindowSyncer:
         import random as _random
         self._delay_rng: _random.Random = _random.Random()
 
-    def start_round(self, round_id: int) -> None:
-        self._state = _SyncerState(round_id=round_id, round_start_s=self._clock())
+    def start_round(
+        self,
+        round_id: int,
+        expected_learner_ids: set[str] | None = None,
+        total_learners: int | None = None,
+    ) -> None:
+        """Begin a new outer round.
+
+        Args:
+            round_id: monotonic outer-round counter.
+            expected_learner_ids: the set of learner (rack) ids this round
+                expects to hear from. When provided, the syncer can early-
+                finalize the moment every expected, non-fail-slow learner has
+                reported and quorum is met (reason "all_present"), instead of
+                always waiting out the full grace window. It also enables the
+                absentee diagnostic (`MergeResult.learners_absent`). When None
+                (the default), behavior is byte-for-byte identical to before:
+                quorum, then the full grace window, and an empty
+                `learners_absent`.
+            total_learners: the expected total learner count for this round.
+                Used only to validate the quorum against the round's world
+                size. A bare count does NOT enable early-finalize on its own:
+                a count cannot name the expected ids, so when
+                `expected_learner_ids` is omitted the expected set stays
+                unknown and early-finalize stays disabled. If both are given,
+                the count must equal the set size.
+
+        Raises:
+            ValueError: if `quorum_min_learners` exceeds the round's known
+                total (`total_learners`, or `len(expected_learner_ids)` when
+                no count is given), since quorum could then never be met; or
+                if both `total_learners` and `expected_learner_ids` are given
+                and disagree.
+        """
+        expected: Optional[set[str]] = (
+            set(expected_learner_ids) if expected_learner_ids is not None else None
+        )
+        known_total: Optional[int] = total_learners
+        if expected is not None:
+            if total_learners is not None and total_learners != len(expected):
+                raise ValueError(
+                    f"total_learners ({total_learners}) must equal "
+                    f"len(expected_learner_ids) ({len(expected)}) when both "
+                    f"are provided"
+                )
+            if known_total is None:
+                known_total = len(expected)
+        if known_total is not None and self.quorum_min > known_total:
+            raise ValueError(
+                f"quorum_min_learners ({self.quorum_min}) cannot exceed the "
+                f"round's total learners ({known_total}); quorum could never "
+                f"be met"
+            )
+        self._state = _SyncerState(
+            round_id=round_id,
+            round_start_s=self._clock(),
+            expected_learner_ids=expected,
+        )
 
     def mark_failslow(self, learner_id: str) -> None:
         """Exclude a learner from this round (FALCON integration point).
@@ -236,15 +334,45 @@ class GraceWindowSyncer:
             self._state.k_satisfied_at_s = self._clock()
         return self.tick()
 
+    def _all_expected_present(self) -> bool:
+        """True when expected-learner awareness is active, quorum is met, and
+        every expected, non-fail-slow learner has already submitted a fragment
+        for this round.
+
+        Returns False when the expected set is unknown (None), preserving the
+        historical quorum-then-full-grace behavior byte-for-byte.
+        """
+        assert self._state is not None
+        expected = self._state.expected_learner_ids
+        if expected is None:
+            return False
+        if self._state.k_satisfied_at_s is None:
+            return False  # quorum not yet met
+        received = set(self._state.fragments.keys())
+        excluded = self._state.failslow_excluded
+        # The expected learners we still need to hear from: expected, minus the
+        # ones that already reported, minus the ones we've given up on
+        # (fail-slow-excluded). Empty -> nothing left to wait for.
+        pending = expected - received - excluded
+        return not pending
+
     def tick(self) -> Optional[MergeResult]:
         """Check whether the round can complete now. Returns a MergeResult
-        if grace has elapsed; otherwise None."""
+        if it can finalize (all expected learners present, or grace elapsed);
+        otherwise None."""
         if self._state is None:
             return None
         if self._state.k_satisfied_at_s is None:
             return None
         now = self._clock()
         elapsed_ms = (now - self._state.k_satisfied_at_s) * 1000.0
+        # Early-finalize: when this round knows its expected learners and every
+        # expected, non-fail-slow learner has reported, finalize immediately
+        # without waiting out the remaining grace window. When the expected set
+        # is unknown this is always False, so the historical quorum-then-full-
+        # grace path below is taken byte-for-byte.
+        if self._all_expected_present():
+            return self._finalize(reason="all_present", elapsed_grace_ms=elapsed_ms)
         if elapsed_ms >= self.grace_window_ms:
             return self._finalize(reason="grace_expired", elapsed_grace_ms=elapsed_ms)
         return None
@@ -362,6 +490,18 @@ class GraceWindowSyncer:
         merger = token_weighted_merge if self.token_weighted else uniform_merge
         fragments = list(self._state.fragments.values())
         merged = merger(fragments)
+        # Absentee diagnostic: expected learners neither received nor
+        # fail-slow-excluded at finalize. Empty when the expected set is
+        # unknown (the historical default) -- a `learners_absent` of [] then
+        # carries the same "we don't track this" meaning it always has.
+        expected = self._state.expected_learner_ids
+        if expected is None:
+            learners_absent: list[str] = []
+        else:
+            received = set(self._state.fragments.keys())
+            learners_absent = sorted(
+                expected - received - self._state.failslow_excluded
+            )
         result = MergeResult(
             round_id=self._state.round_id,
             merged_delta=merged,
@@ -369,6 +509,7 @@ class GraceWindowSyncer:
             learners_excluded=sorted(self._state.failslow_excluded),
             elapsed_grace_ms=elapsed_grace_ms,
             reason=reason,
+            learners_absent=learners_absent,
         )
         self._state = None
         return result
