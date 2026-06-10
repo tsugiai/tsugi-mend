@@ -43,9 +43,11 @@ done by hand. They are intentionally NOT in any workflow file.
 The release pipeline runs on a published GitHub Release. Version is set in
 `pyproject.toml`.
 
-1. Bump `version` in `pyproject.toml` (e.g. `0.1.0 -> 0.1.1`) and commit on `main`
-   via the normal PR flow. (This PR does NOT bump the version; the workflow is
-   first exercised on the next real release.)
+1. Bump the version in ALL THREE hardcoded locations (they must match):
+   `version` in `pyproject.toml`, `__version__` in
+   `src/tsugi_mend/__init__.py`, and the `## Status` line in `README.md`.
+   Move the `[Unreleased]` section of `CHANGELOG.md` under the new
+   `[X.Y.Z] - YYYY-MM-DD` heading. Commit on `main` via the normal PR flow.
 
 2. Tag and create a GitHub Release on the merge commit:
 

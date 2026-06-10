@@ -69,11 +69,16 @@ class MendConfig:
     # ROSTER-ID CONTRACT (load-bearing): each id here MUST equal a
     # `LearnerFragment.learner_id` the round's fragment_provider delivers
     # (e.g. "rack-0", "rack-1"), NOT necessarily this process's own
-    # `rank_id`. The expected set is matched against the arriving
-    # fragments' learner_id by the syncer. A misdeclared roster (ids that
-    # never arrive, or a quorum the roster cannot satisfy) is SAFE: the
-    # runtime falls back to the expected=None path (quorum, then full
-    # grace) rather than hanging or changing the merged result.
+    # `rank_id`, and the roster must be EXHAUSTIVE: name every learner
+    # expected to report this round. The expected set is matched against
+    # the arriving fragments' learner_id by the syncer. Ids that never
+    # arrive are safe: early-finalize never fires, the round falls back to
+    # quorum-then-grace, and the absentees are reported. A quorum the
+    # roster cannot satisfy is rejected at config init. An UNDER-DECLARED
+    # roster (one that omits a live learner) is NOT detected: the round
+    # early-finalizes once the declared set is present, which can exclude
+    # a late straggler that a roster-unaware round would have merged
+    # within the remaining grace window. Declare the full roster.
     expected_learner_ids: Optional[tuple[str, ...]] = None
     # Outer-optimizer momentum (Nesterov). DiLoCo / Decoupled DiLoCo
     # default.
