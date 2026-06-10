@@ -21,6 +21,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   total now rejects `quorum_min_learners > total` with a clear `ValueError`.
   This closes the documented 3+/4+ rack gap (needless post-quorum latency and
   no absentee diagnostic) at flat-merge granularity.
+- Runtime wiring for `MendConfig.expected_learner_ids`, an opt-in
+  `tuple[str, ...] | None` that threads the operator-declared learner roster
+  through `mend_init` into `ConcurrentOuterStep` and
+  `GraceWindowSyncer.start_round`. The identifiers must match incoming
+  `LearnerFragment.learner_id` values. The default `None` preserves the
+  roster-unaware quorum-then-full-grace path.
 
 ### Changed
 
@@ -29,6 +35,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   both omitted, behavior is **byte-for-byte identical** to before: quorum, then
   the full grace window, and an empty `learners_absent`. No public symbol was
   renamed or removed; the change is additive.
+- `ConcurrentOuterStep` now falls back to the roster-unaware path if a declared
+  roster cannot be used for a round, including an internally inconsistent
+  quorum or an unexpected learner id observed before completion. The fallback
+  keeps the merged delta identical to the default path for the same fragment
+  arrivals.
 
 ## [0.1.3] - 2026-06-09
 

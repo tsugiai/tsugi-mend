@@ -54,6 +54,18 @@ None of these mechanisms exercise TsugiCinema's K-Pool LoRA (App. 64/060,315) or
 - Custom C++ NCCL ProcessGroup. Python-level integration is sufficient for the current roadmap.
 - Custom multi-rack reducer *topology* (hierarchical / tree all-reduce across many racks). The GraceWindowSyncer is world-size-aware: pass `start_round(round_id, expected_learner_ids=...)` and it finalizes early the moment every expected, non-fail-slow learner has reported (`MergeResult.reason == "all_present"`) instead of always waiting out the grace window, and it reports which expected learners were absent at finalize (`MergeResult.learners_absent`). What remains future work is a *hierarchical* aggregation topology (e.g. per-rack pre-reduction feeding a top-level merge) for very large rack counts; the current merge is still a single flat token-weighted aggregation.
 
+The live `mend_init` runtime path can now use that world-size awareness through
+`MendConfig.expected_learner_ids`. When set, the tuple is passed from
+the runtime container into `ConcurrentOuterStep`, then into
+`GraceWindowSyncer.start_round(expected_learner_ids=...)` for each submitted
+outer round. The roster identifiers are the same strings carried on incoming
+`LearnerFragment.learner_id` values from the fragment provider. Leave the config
+field as `None` when the runtime cannot name the complete learner set. If an
+unexpected learner id is observed before a round completes, or if the declared
+roster cannot satisfy the configured quorum, the orchestrator restarts that
+round in roster-unaware mode so the result matches the historical
+quorum-then-full-grace path for the same fragment arrivals.
+
 ## Online runtime autotuner (opt-in, default OFF)
 
 `autotuner.RuntimeAutotuner` continuously adapts two operational knobs from the runtime's own observed per-rank step-time stream, past a short warmup window. It is gated behind `MendConfig.auto_tune_runtime` (default `False`), so default-mode behavior is byte-for-byte unchanged.

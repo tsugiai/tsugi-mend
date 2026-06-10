@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 from tsugi_mend import MendConfig, mend_init, mend_shutdown
-from tsugi_mend.reducer import LearnerFragment
+from tsugi_mend.reducer import LearnerFragment, MergeResult
 from tsugi_mend.runtime import get_runtime
 
 
@@ -127,6 +127,61 @@ def _build_fragment(learner_id: str, round_id: int, value: float) -> LearnerFrag
     )
 
 
+def _provider_from_fragments(
+    fragments: list[LearnerFragment],
+) -> "asyncio.Queue[LearnerFragment]":
+    queue: asyncio.Queue[LearnerFragment] = asyncio.Queue()
+
+    async def drip() -> None:
+        for fragment in fragments:
+            await queue.put(fragment)
+
+    asyncio.get_event_loop().create_task(drip())
+    return queue
+
+
+def _collect_runtime_outer_step(runtime, timeout_s: float = 2.0) -> MergeResult:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = runtime.outer_step_collect()
+        if result is not None:
+            return result
+        time.sleep(0.005)
+    raise AssertionError("outer-step did not complete within timeout")
+
+
+def _run_runtime_round(
+    tmp_path,
+    expected_learner_ids: tuple[str, ...] | None,
+    fragments: list[LearnerFragment],
+    *,
+    round_id: int = 7,
+    grace_window_ms: int = 20,
+) -> MergeResult:
+    model = ToyLoraStyleModel()
+    diag_suffix = "default" if expected_learner_ids is None else "_".join(expected_learner_ids)
+    config = MendConfig(
+        quorum_min_learners=2,
+        grace_window_ms=grace_window_ms,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        expected_learner_ids=expected_learner_ids,
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / f"diag-{diag_suffix}"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    runtime = get_runtime(model)
+    try:
+        runtime.outer_step_begin(
+            round_id=round_id,
+            fragment_provider=lambda: _provider_from_fragments(fragments),
+        )
+        return _collect_runtime_outer_step(runtime)
+    finally:
+        mend_shutdown(model)
+
+
 def test_outer_step_runtime_methods_succeed_when_concurrent_enabled(tmp_path):
     """When concurrent_outer_step=True, the runtime exposes the three
     outer-step methods and they orchestrate an async merge that
@@ -187,6 +242,105 @@ def test_outer_step_runtime_methods_succeed_when_concurrent_enabled(tmp_path):
     # Verify the mend_init event flags concurrent_outer_step_active=True.
     init_event = next(e for e in events if e["event"] == "mend_init")
     assert init_event["concurrent_outer_step_active"] is True
+
+
+def test_expected_learner_ids_enable_runtime_early_finalize(tmp_path):
+    """The runtime threads MendConfig.expected_learner_ids through to the
+    ConcurrentOuterStep path, enabling syncer early-finalize."""
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=2,
+        grace_window_ms=1000,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        expected_learner_ids=("rack-a", "rack-b"),
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        fragments = [
+            _build_fragment("rack-a", 7, value=1.0),
+            _build_fragment("rack-b", 7, value=3.0),
+        ]
+        rt.outer_step_begin(
+            round_id=7,
+            fragment_provider=lambda: _provider_from_fragments(fragments),
+        )
+        result = _collect_runtime_outer_step(rt)
+        assert result.reason == "all_present"
+        assert result.learners_absent == []
+        assert sorted(result.learners_merged) == ["rack-a", "rack-b"]
+        assert torch.equal(result.merged_delta[0], torch.tensor([2.0]))
+    finally:
+        mend_shutdown(model)
+
+    diag_files = list((tmp_path / "diag").glob("max_sdk_pid*.jsonl"))
+    assert diag_files
+    events = [json.loads(line) for line in open(diag_files[0])]
+    collected = next(e for e in events if e["event"] == "outer_step_collect")
+    assert collected["reason"] == "all_present"
+    assert collected["learners_absent"] == []
+
+
+def test_expected_learner_ids_report_absent_and_preserve_merge(tmp_path):
+    """Missing expected learners are reported, while the merged delta matches
+    the default roster-unaware path for the same fragment arrivals."""
+    fragments = [
+        _build_fragment("rack-a", 11, value=1.0),
+        _build_fragment("rack-b", 11, value=3.0),
+    ]
+    aware = _run_runtime_round(
+        tmp_path,
+        expected_learner_ids=("rack-a", "rack-b", "rack-c"),
+        fragments=fragments,
+        round_id=11,
+    )
+    unaware = _run_runtime_round(
+        tmp_path,
+        expected_learner_ids=None,
+        fragments=[
+            _build_fragment("rack-a", 11, value=1.0),
+            _build_fragment("rack-b", 11, value=3.0),
+        ],
+        round_id=11,
+    )
+
+    assert aware.reason == "grace_expired"
+    assert aware.learners_absent == ["rack-c"]
+    assert sorted(aware.learners_merged) == ["rack-a", "rack-b"]
+    assert torch.equal(aware.merged_delta[0], unaware.merged_delta[0])
+
+
+def test_misdeclared_expected_learner_ids_fall_back_to_default_merge(tmp_path):
+    """If an unexpected learner id arrives before completion, the
+    orchestrator restarts the round in roster-unaware mode."""
+    fragments = [
+        _build_fragment("rack-a", 13, value=1.0),
+        _build_fragment("rack-b", 13, value=5.0),
+    ]
+    fallback = _run_runtime_round(
+        tmp_path,
+        expected_learner_ids=("rack-a", "rack-missing"),
+        fragments=fragments,
+        round_id=13,
+    )
+    unaware = _run_runtime_round(
+        tmp_path,
+        expected_learner_ids=None,
+        fragments=[
+            _build_fragment("rack-a", 13, value=1.0),
+            _build_fragment("rack-b", 13, value=5.0),
+        ],
+        round_id=13,
+    )
+
+    assert fallback.reason == unaware.reason == "grace_expired"
+    assert fallback.learners_absent == []
+    assert sorted(fallback.learners_merged) == ["rack-a", "rack-b"]
+    assert torch.equal(fallback.merged_delta[0], unaware.merged_delta[0])
 
 
 def test_outer_step_begin_raises_when_concurrent_disabled():

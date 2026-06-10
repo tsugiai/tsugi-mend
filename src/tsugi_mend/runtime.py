@@ -165,6 +165,7 @@ class _MaxRuntime:
             self._concurrent_orch = ConcurrentOuterStep(
                 syncer=self.syncer,
                 loop=self._loop,
+                expected_learner_ids=self.config.expected_learner_ids,
             )
         # Initial topology classification. The hostname map may be sparse
         # at startup; the runtime can call refresh_topology() later once
@@ -448,6 +449,7 @@ class _MaxRuntime:
                 round_id=result.round_id,
                 learners_merged=result.learners_merged,
                 learners_excluded=result.learners_excluded,
+                learners_absent=result.learners_absent,
                 elapsed_grace_ms=result.elapsed_grace_ms,
                 reason=result.reason,
             )

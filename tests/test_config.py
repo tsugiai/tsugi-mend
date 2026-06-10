@@ -10,6 +10,7 @@ def test_defaults_construct():
     c = MendConfig()
     assert c.quorum_min_learners == 4
     assert c.grace_window_ms == 2000
+    assert c.expected_learner_ids is None
     assert c.token_weighted_merge is True
     assert c.sync_period_steps == 128
     assert c.momentum_sync_period_steps == 512
@@ -31,6 +32,18 @@ def test_grace_window_nonnegative():
     MendConfig(grace_window_ms=0)  # zero is allowed (immediate close after K-th)
     with pytest.raises(ValueError, match="grace_window_ms"):
         MendConfig(grace_window_ms=-1)
+
+
+def test_expected_learner_ids_validation():
+    MendConfig(expected_learner_ids=("rack-a", "rack-b"))
+    with pytest.raises(ValueError, match="expected_learner_ids"):
+        MendConfig(expected_learner_ids=[])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-empty"):
+        MendConfig(expected_learner_ids=())
+    with pytest.raises(ValueError, match="non-empty strings"):
+        MendConfig(expected_learner_ids=("rack-a", ""))
+    with pytest.raises(ValueError, match="duplicate"):
+        MendConfig(expected_learner_ids=("rack-a", "rack-a"))
 
 
 def test_outer_momentum_range():

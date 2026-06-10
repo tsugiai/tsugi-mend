@@ -52,6 +52,11 @@ class MendConfig:
     # milliseconds for additional learners before performing the merge.
     # Algorithm 2 "adaptive grace window".
     grace_window_ms: int = 2000
+    # Optional operator-declared learner roster for the live concurrent
+    # outer-step path. These ids must match LearnerFragment.learner_id values
+    # supplied by the runtime's fragment provider. None preserves the legacy
+    # quorum-then-full-grace behavior.
+    expected_learner_ids: tuple[str, ...] | None = None
     # Per-learner contribution weighting. Decoupled DiLoCo paper merges
     # by the number of tokens consumed by that learner since the last
     # outer step (Algorithm 2 line 11).
@@ -275,6 +280,23 @@ class MendConfig:
             )
         if self.grace_window_ms < 0:
             raise ValueError(f"grace_window_ms must be >= 0; got {self.grace_window_ms}")
+        if self.expected_learner_ids is not None:
+            if not isinstance(self.expected_learner_ids, tuple):
+                raise ValueError("expected_learner_ids must be a tuple[str, ...] or None")
+            if not self.expected_learner_ids:
+                raise ValueError("expected_learner_ids must be non-empty when configured")
+            seen_expected: set[str] = set()
+            for learner_id in self.expected_learner_ids:
+                if not isinstance(learner_id, str) or learner_id == "":
+                    raise ValueError(
+                        "expected_learner_ids entries must be non-empty strings"
+                    )
+                if learner_id in seen_expected:
+                    raise ValueError(
+                        f"expected_learner_ids contains duplicate learner id "
+                        f"{learner_id!r}"
+                    )
+                seen_expected.add(learner_id)
         if not (0.0 <= self.outer_optimizer_momentum < 1.0):
             raise ValueError(
                 f"outer_optimizer_momentum must be in [0, 1); "

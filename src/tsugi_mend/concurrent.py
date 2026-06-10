@@ -29,6 +29,7 @@ Public API (used by `runtime.py`):
         syncer=GraceWindowSyncer(...),
         loop=asyncio_event_loop,
         clock=time.monotonic,
+        expected_learner_ids=("rack-a", "rack-b"),
     )
     orch.submit_async(round_id, local_fragment_provider)
     # ... continue inner-step training ...
@@ -99,6 +100,10 @@ class ConcurrentOuterStep:
             while waiting for the grace window. Default 0.005 s = 5ms.
             Stage A tests override this to make the unit test
             deterministic.
+        expected_learner_ids: optional operator-declared learner roster
+            for the current process. These ids must match the
+            LearnerFragment.learner_id values yielded by the fragment
+            provider. None preserves the historical full-grace behavior.
 
     The orchestrator is single-round: only one outer-round may be in
     flight at any time. Calling submit_async() while a round is PENDING
@@ -116,10 +121,12 @@ class ConcurrentOuterStep:
         loop: asyncio.AbstractEventLoop,
         clock: Optional[Callable[[], float]] = None,
         tick_interval_s: float = 0.005,
+        expected_learner_ids: tuple[str, ...] | None = None,
     ) -> None:
         self._syncer = syncer
         self._loop = loop
         self._clock = clock or time.monotonic
+        self._expected_learner_ids = expected_learner_ids
         self._tick_interval_s = tick_interval_s
 
         self._state: _State = _State.IDLE
@@ -224,7 +231,13 @@ class ConcurrentOuterStep:
     ) -> MergeResult:
         """Coroutine body: pull fragments from the provider's queue,
         drive the GraceWindowSyncer until tick() returns a MergeResult."""
-        self._syncer.start_round(round_id)
+        expected = (
+            set(self._expected_learner_ids)
+            if self._expected_learner_ids is not None
+            else None
+        )
+        active_expected = self._start_syncer_round(round_id, expected)
+        submitted_fragments: list[LearnerFragment] = []
         queue = fragment_provider()
 
         # Bound the total wait by 2x the grace window plus the per-tick
@@ -252,7 +265,20 @@ class ConcurrentOuterStep:
                 fragment = None
 
             if fragment is not None:
-                result = self._syncer.submit(fragment)
+                if (
+                    active_expected is not None
+                    and fragment.round_id == round_id
+                    and fragment.learner_id not in active_expected
+                ):
+                    active_expected = None
+                    submitted_fragments.append(fragment)
+                    result = self._fallback_to_unaware_round(
+                        round_id=round_id,
+                        fragments=submitted_fragments,
+                    )
+                else:
+                    submitted_fragments.append(fragment)
+                    result = self._syncer.submit(fragment)
                 if result is not None:
                     return result
 
@@ -261,6 +287,58 @@ class ConcurrentOuterStep:
             result = self._syncer.tick()
             if result is not None:
                 return result
+
+    def _start_syncer_round(
+        self,
+        round_id: int,
+        expected_learner_ids: set[str] | None,
+    ) -> set[str] | None:
+        """Start a syncer round, falling back to legacy roster-unaware mode
+        if the declared roster is internally inconsistent with the quorum."""
+        if expected_learner_ids is None:
+            self._syncer.start_round(round_id)
+            return None
+        try:
+            self._syncer.start_round(
+                round_id,
+                expected_learner_ids=expected_learner_ids,
+            )
+        except ValueError as exc:
+            _LOG.warning(
+                "ConcurrentOuterStep falling back to roster-unaware round %s: %s",
+                round_id,
+                exc,
+            )
+            self._syncer.start_round(round_id)
+            return None
+        return expected_learner_ids
+
+    def _fallback_to_unaware_round(
+        self,
+        round_id: int,
+        fragments: list[LearnerFragment],
+    ) -> Optional[MergeResult]:
+        """Restart the in-flight round without expected-learner awareness
+        and replay the fragments already observed by the orchestrator.
+
+        This handles a misdeclared roster where an unexpected learner id is
+        observed before the round completes. The merge math stays in
+        GraceWindowSyncer; this method only switches the control law back to
+        the historical quorum-then-full-grace path.
+        """
+        _LOG.warning(
+            "ConcurrentOuterStep falling back to roster-unaware round %s after "
+            "observing learner id %r outside expected_learner_ids",
+            round_id,
+            fragments[-1].learner_id,
+        )
+        self._syncer.start_round(round_id)
+        result: Optional[MergeResult] = None
+        for replayed in fragments:
+            result = self._syncer.submit(replayed)
+            if result is not None:
+                return result
+        return result
 
     def _on_task_done(self, task: Future[MergeResult]) -> None:
         """asyncio thread callback: transition the state machine on
