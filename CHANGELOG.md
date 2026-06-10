@@ -9,6 +9,30 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
+- World-size-aware multi-rack reducer is now **wired live through the runtime**.
+  New `MendConfig.expected_learner_ids: tuple[str, ...] | None` (default `None`)
+  declares the round's expected learner (rack) roster; the runtime threads it
+  into `ConcurrentOuterStep`, which passes it to
+  `GraceWindowSyncer.start_round(round_id, expected_learner_ids=...)` on every
+  outer round, so the early-finalize (`reason == "all_present"`) and absentee
+  diagnostic (`MergeResult.learners_absent`) added in the previous entry are no
+  longer dormant. `ConcurrentOuterStep.__init__` / `submit_async` and
+  `mend`'s `outer_step_begin` gained an optional `expected_learner_ids:
+  frozenset[str] | None` (constructor default plus per-round override) for
+  clusters whose live world size changes round-to-round. The
+  `outer_step_collect` diagnostic event now also carries `learners_absent`.
+  **Roster-id contract:** each declared id must equal a
+  `LearnerFragment.learner_id` the round's fragment provider delivers (not
+  necessarily this process's own `rank_id`). **Safe fallback:** a roster too
+  small to satisfy quorum is rejected at config init (config-level roster) or
+  dropped to the `None` path with a warning (per-round override); a roster
+  naming learners that never arrive is inert (early-finalize simply never
+  fires, the round finalizes via grace, absentees show up in
+  `learners_absent`). A misdeclared roster never hangs the round or changes the
+  merged result. **Bit-exact:** with the default `None`, the path is
+  byte-for-byte unchanged; when on, early-finalize merges the same fragment set
+  grace-expiry would, so the merged delta is identical (asserted with
+  `torch.equal` in the new `concurrent`/`runtime` integration tests).
 - World-size-aware multi-rack reducer for `reducer.GraceWindowSyncer`.
   `start_round` now accepts optional `expected_learner_ids: set[str] | None`
   (and `total_learners: int | None`). When the expected learner set is known,
@@ -29,6 +53,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   both omitted, behavior is **byte-for-byte identical** to before: quorum, then
   the full grace window, and an empty `learners_absent`. No public symbol was
   renamed or removed; the change is additive.
+- `ConcurrentOuterStep.__init__`, `ConcurrentOuterStep.submit_async`, and the
+  runtime's `outer_step_begin` gained an optional `expected_learner_ids`
+  keyword (default `None`). All additive; the default path is unchanged.
 
 ## [0.1.3] - 2026-06-09
 

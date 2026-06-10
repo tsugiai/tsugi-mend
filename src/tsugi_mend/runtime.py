@@ -162,9 +162,21 @@ class _MaxRuntime:
         # orchestrator's submit_async / collect API.
         if self.config.concurrent_outer_step:
             assert self._loop is not None
+            # Thread the operator-declared expected-learner roster (if any)
+            # into the orchestrator so the world-size-aware early-finalize
+            # path (reason "all_present") + absentee diagnostic go live.
+            # None -> byte-for-byte the historical quorum-then-full-grace
+            # behavior. See the roster-id contract on
+            # MendConfig.expected_learner_ids.
+            expected_roster: Optional[frozenset[str]] = (
+                frozenset(self.config.expected_learner_ids)
+                if self.config.expected_learner_ids is not None
+                else None
+            )
             self._concurrent_orch = ConcurrentOuterStep(
                 syncer=self.syncer,
                 loop=self._loop,
+                expected_learner_ids=expected_roster,
             )
         # Initial topology classification. The hostname map may be sparse
         # at startup; the runtime can call refresh_topology() later once
@@ -398,6 +410,7 @@ class _MaxRuntime:
         self,
         round_id: int,
         fragment_provider: FragmentProvider,
+        expected_learner_ids: Optional[frozenset[str]] = None,
     ) -> None:
         """Begin an asynchronous outer-round cross-rack merge.
 
@@ -405,6 +418,14 @@ class _MaxRuntime:
         asyncio loop thread; the training loop should continue issuing
         inner steps (async-TP-overlapped forward / backward keeps GPUs
         busy through the grace window).
+
+        `expected_learner_ids` optionally overrides the config-supplied
+        roster for THIS round only (useful when the live world size changes
+        round-to-round). When None, the config's
+        `expected_learner_ids` (threaded to the orchestrator at start) is
+        used; when both are None the syncer takes the historical
+        quorum-then-full-grace path (byte-for-byte). See the roster-id
+        contract on MendConfig.expected_learner_ids.
 
         Raises RuntimeError if concurrent_outer_step is False in the
         config (caller should use the synchronous syncer path instead),
@@ -418,7 +439,9 @@ class _MaxRuntime:
                 "path or enable concurrent_outer_step"
             )
         self._concurrent_orch.submit_async(
-            round_id=round_id, fragment_provider=fragment_provider
+            round_id=round_id,
+            fragment_provider=fragment_provider,
+            expected_learner_ids=expected_learner_ids,
         )
         self.diagnostics.emit(
             "outer_step_begin",
@@ -448,6 +471,7 @@ class _MaxRuntime:
                 round_id=result.round_id,
                 learners_merged=result.learners_merged,
                 learners_excluded=result.learners_excluded,
+                learners_absent=result.learners_absent,
                 elapsed_grace_ms=result.elapsed_grace_ms,
                 reason=result.reason,
             )

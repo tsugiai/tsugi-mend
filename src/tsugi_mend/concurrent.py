@@ -116,11 +116,18 @@ class ConcurrentOuterStep:
         loop: asyncio.AbstractEventLoop,
         clock: Optional[Callable[[], float]] = None,
         tick_interval_s: float = 0.005,
+        expected_learner_ids: Optional[frozenset[str]] = None,
     ) -> None:
         self._syncer = syncer
         self._loop = loop
         self._clock = clock or time.monotonic
         self._tick_interval_s = tick_interval_s
+        # Default expected-learner roster threaded to syncer.start_round so
+        # the world-size-aware early-finalize path goes live. None ->
+        # byte-for-byte the historical quorum-then-full-grace behavior. A
+        # per-round override may be supplied to submit_async(). See the
+        # roster-id contract on MendConfig.expected_learner_ids.
+        self._expected_learner_ids: Optional[frozenset[str]] = expected_learner_ids
 
         self._state: _State = _State.IDLE
         self._pending: Optional[_PendingRound] = None
@@ -136,6 +143,7 @@ class ConcurrentOuterStep:
         self,
         round_id: int,
         fragment_provider: FragmentProvider,
+        expected_learner_ids: Optional[frozenset[str]] = None,
     ) -> None:
         """Submit an outer-round for asynchronous merge. Returns immediately.
 
@@ -145,8 +153,21 @@ class ConcurrentOuterStep:
         the asyncio task waits on queue.get() with a timeout bounded by
         the grace window.
 
+        `expected_learner_ids` optionally overrides the orchestrator-level
+        roster for THIS round only. When omitted, the constructor-supplied
+        default roster is used; when both are None the syncer takes the
+        historical quorum-then-full-grace path (byte-for-byte). See the
+        roster-id contract on MendConfig.expected_learner_ids; a roster that
+        cannot be reconciled with quorum falls back to the None path rather
+        than raising or hanging.
+
         Raises RuntimeError if a previous round is still PENDING.
         """
+        roster = (
+            expected_learner_ids
+            if expected_learner_ids is not None
+            else self._expected_learner_ids
+        )
         with self._lock:
             if self._state == _State.PENDING:
                 raise RuntimeError(
@@ -159,7 +180,7 @@ class ConcurrentOuterStep:
             self._error = None
 
         # Schedule the merge coroutine on the asyncio thread.
-        coro = self._run_merge(round_id, fragment_provider)
+        coro = self._run_merge(round_id, fragment_provider, roster)
         task = asyncio.run_coroutine_threadsafe(coro, self._loop)
         # Attach a done-callback so we transition to READY/FAILED without
         # the caller having to await.
@@ -221,10 +242,34 @@ class ConcurrentOuterStep:
         self,
         round_id: int,
         fragment_provider: FragmentProvider,
+        expected_learner_ids: Optional[frozenset[str]] = None,
     ) -> MergeResult:
         """Coroutine body: pull fragments from the provider's queue,
         drive the GraceWindowSyncer until tick() returns a MergeResult."""
-        self._syncer.start_round(round_id)
+        # SAFE FALLBACK: only hand the roster to the world-size-aware
+        # start_round path when it can be reconciled with quorum. A roster
+        # smaller than quorum_min could never satisfy quorum and would make
+        # start_round raise; in that misdeclared case we drop to the
+        # expected=None path (quorum, then full grace) so the round neither
+        # hangs nor changes the merged result. A roster naming learners that
+        # never arrive is already safe in the syncer: early-finalize simply
+        # never fires and the round falls through to grace expiry, with the
+        # absentees surfaced in MergeResult.learners_absent.
+        roster = expected_learner_ids
+        if roster is not None and self._syncer.quorum_min > len(roster):
+            _LOG.warning(
+                "ConcurrentOuterStep round %s: declared roster of %d learner(s) "
+                "is smaller than quorum_min=%d; ignoring roster and using the "
+                "quorum-then-grace path",
+                round_id,
+                len(roster),
+                self._syncer.quorum_min,
+            )
+            roster = None
+        if roster is None:
+            self._syncer.start_round(round_id)
+        else:
+            self._syncer.start_round(round_id, expected_learner_ids=set(roster))
         queue = fragment_provider()
 
         # Bound the total wait by 2x the grace window plus the per-tick

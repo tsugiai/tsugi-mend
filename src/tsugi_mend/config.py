@@ -56,6 +56,25 @@ class MendConfig:
     # by the number of tokens consumed by that learner since the last
     # outer step (Algorithm 2 line 11).
     token_weighted_merge: bool = True
+    # Operator-declared expected learner (rack) roster for each outer
+    # round. When set, the runtime threads it to
+    # GraceWindowSyncer.start_round(round_id, expected_learner_ids=...),
+    # which lets the syncer EARLY-FINALIZE the moment every expected,
+    # non-fail-slow learner has reported and quorum is met (instead of
+    # always waiting out the full grace window), and surface the absentee
+    # diagnostic (MergeResult.learners_absent). Default None preserves the
+    # historical quorum-then-full-grace control law byte-for-byte and an
+    # empty learners_absent.
+    #
+    # ROSTER-ID CONTRACT (load-bearing): each id here MUST equal a
+    # `LearnerFragment.learner_id` the round's fragment_provider delivers
+    # (e.g. "rack-0", "rack-1"), NOT necessarily this process's own
+    # `rank_id`. The expected set is matched against the arriving
+    # fragments' learner_id by the syncer. A misdeclared roster (ids that
+    # never arrive, or a quorum the roster cannot satisfy) is SAFE: the
+    # runtime falls back to the expected=None path (quorum, then full
+    # grace) rather than hanging or changing the merged result.
+    expected_learner_ids: Optional[tuple[str, ...]] = None
     # Outer-optimizer momentum (Nesterov). DiLoCo / Decoupled DiLoCo
     # default.
     outer_optimizer_momentum: float = 0.9
@@ -275,6 +294,28 @@ class MendConfig:
             )
         if self.grace_window_ms < 0:
             raise ValueError(f"grace_window_ms must be >= 0; got {self.grace_window_ms}")
+        if self.expected_learner_ids is not None:
+            roster = self.expected_learner_ids
+            for lid in roster:
+                if not isinstance(lid, str) or lid == "":
+                    raise ValueError(
+                        "expected_learner_ids entries must be non-empty strings; "
+                        f"got {lid!r}"
+                    )
+            if len(set(roster)) != len(roster):
+                raise ValueError(
+                    f"expected_learner_ids must not contain duplicates; got {roster!r}"
+                )
+            # Consistent with GraceWindowSyncer.start_round's own validation:
+            # quorum can never be met if it exceeds the declared roster size.
+            # Reject at config time so the operator gets a clear error rather
+            # than a runtime fallback that silently ignores the roster.
+            if self.quorum_min_learners > len(roster):
+                raise ValueError(
+                    f"quorum_min_learners ({self.quorum_min_learners}) cannot exceed "
+                    f"len(expected_learner_ids) ({len(roster)}); quorum could never "
+                    f"be met"
+                )
         if not (0.0 <= self.outer_optimizer_momentum < 1.0):
             raise ValueError(
                 f"outer_optimizer_momentum must be in [0, 1); "
