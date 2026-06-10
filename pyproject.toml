@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tsugi-mend"
-version = "0.1.3"
+version = "0.1.4"
 description = "tsugiai-mend-sdk. Maximum-uplift cross-rack distributed-training reducer built on Decoupled DiLoCo + DES-LOC + async tensor parallelism + FALCON fail-slow mitigation. Patent-independent by deliberate construction; see LICENSE preamble."
 readme = "README.md"
 requires-python = ">=3.10"

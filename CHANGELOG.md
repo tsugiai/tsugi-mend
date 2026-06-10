@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.4] - 2026-06-10
 
 ### Added
 
@@ -23,16 +23,25 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `outer_step_collect` diagnostic event now also carries `learners_absent`.
   **Roster-id contract:** each declared id must equal a
   `LearnerFragment.learner_id` the round's fragment provider delivers (not
-  necessarily this process's own `rank_id`). **Safe fallback:** a roster too
-  small to satisfy quorum is rejected at config init (config-level roster) or
-  dropped to the `None` path with a warning (per-round override); a roster
-  naming learners that never arrive is inert (early-finalize simply never
-  fires, the round finalizes via grace, absentees show up in
-  `learners_absent`). A misdeclared roster never hangs the round or changes the
-  merged result. **Bit-exact:** with the default `None`, the path is
-  byte-for-byte unchanged; when on, early-finalize merges the same fragment set
-  grace-expiry would, so the merged delta is identical (asserted with
-  `torch.equal` in the new `concurrent`/`runtime` integration tests).
+  necessarily this process's own `rank_id`), and the roster must be
+  **exhaustive**: name every learner expected to report this round. **Safe
+  fallback:** a roster too small to satisfy quorum is rejected at config init
+  (config-level roster) or dropped to the `None` path with a warning
+  (per-round override); a roster naming learners that never arrive is inert
+  (early-finalize simply never fires, the round finalizes via grace once
+  quorum is met by the learners that do arrive, absentees show up in
+  `learners_absent`). Neither case hangs the round or changes the merged
+  result. An **under-declared** roster (one that omits a live learner) is not
+  detected: the round early-finalizes once the declared set is present, which
+  can exclude a late straggler that a roster-unaware round would have merged
+  within the remaining grace window; a stricter detect-and-replay fallback is
+  tracked as future work. **Bit-exact:** with the default `None`, the merge
+  control law and merged tensors are unchanged (the only observable
+  default-mode difference is the additive `learners_absent` field/diagnostic
+  key, always `[]`); when on, early-finalize merges the same fragment set
+  grace-expiry would for the same arrivals, so the merged delta is
+  bit-identical (asserted with `torch.equal` in the new
+  `concurrent`/`runtime` integration tests).
 - World-size-aware multi-rack reducer for `reducer.GraceWindowSyncer`.
   `start_round` now accepts optional `expected_learner_ids: set[str] | None`
   (and `total_learners: int | None`). When the expected learner set is known,
@@ -50,9 +59,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - `start_round(round_id)` gained two optional keyword parameters
   (`expected_learner_ids`, `total_learners`), both defaulting to `None`. With
-  both omitted, behavior is **byte-for-byte identical** to before: quorum, then
-  the full grace window, and an empty `learners_absent`. No public symbol was
-  renamed or removed; the change is additive.
+  both omitted, the control law is unchanged: quorum, then the full grace
+  window, and an empty `learners_absent`. No public symbol was renamed or
+  removed; the change is additive.
 - `ConcurrentOuterStep.__init__`, `ConcurrentOuterStep.submit_async`, and the
   runtime's `outer_step_begin` gained an optional `expected_learner_ids`
   keyword (default `None`). All additive; the default path is unchanged.
