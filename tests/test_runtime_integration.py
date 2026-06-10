@@ -479,3 +479,377 @@ def test_full_training_loop_with_concurrent_outer_step(tmp_path):
         f"only collected {len(collected_round_ids)} outer-rounds; "
         f"expected at least 2 across 20 inner-steps with sync_period=5"
     )
+
+
+# ---------------------------------------------------------------------------
+# ENG-5: world-size-aware multi-rack reducer wired LIVE through the runtime.
+#
+# These tests drive the REAL ConcurrentOuterStep / _MaxRuntime path (via
+# mend_init / outer_step_begin / outer_step_collect) with a multi-learner
+# provider whose fragments carry distinct learner_ids, and assert:
+#   (a) early-finalize fires with reason == "all_present" once every expected
+#       learner reports before the grace window elapses;
+#   (b) MergeResult.learners_absent is populated when an expected learner never
+#       arrives;
+#   (c) the merged delta is bit-identical to the expected=None (no-roster) path
+#       for the same arrivals -- early-finalize merges the same fragment set
+#       grace-expiry would, just sooner.
+#
+# ROSTER-ID CONTRACT exercised here: the declared roster ids EQUAL the
+# learner_id of the fragments the provider delivers ("rack-0", "rack-1", ...).
+# CPU-only, asyncio/in-process; no GPU, no real NCCL.
+# ---------------------------------------------------------------------------
+
+
+def _multi_learner_provider_factory(
+    fragments_spec, send_delay_s: float = 0.0
+):
+    """Build a fragment_provider that drips a list of LearnerFragments (with
+    distinct learner_ids) into the orchestrator's queue.
+
+    `fragments_spec` is a list of LearnerFragment. A fresh queue + drip task
+    is created each time the returned provider is invoked, so the same factory
+    can back several rounds. `send_delay_s` spaces out submissions; 0.0 means
+    "deliver as fast as the loop allows".
+    """
+
+    def provider() -> "asyncio.Queue[LearnerFragment]":
+        queue: asyncio.Queue[LearnerFragment] = asyncio.Queue()
+
+        async def drip() -> None:
+            for f in fragments_spec:
+                if send_delay_s > 0:
+                    await asyncio.sleep(send_delay_s)
+                await queue.put(f)
+
+        asyncio.get_event_loop().create_task(drip())
+        return queue
+
+    return provider
+
+
+def _collect_with_deadline(rt, timeout_s: float = 3.0):
+    """Poll rt.outer_step_collect() until it returns a MergeResult or the
+    deadline elapses. Returns the result (or None on timeout)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = rt.outer_step_collect()
+        if result is not None:
+            return result
+        time.sleep(0.002)
+    return None
+
+
+def test_eng5_early_finalize_fires_all_present_via_runtime(tmp_path):
+    """(a) With the operator-declared roster wired through MendConfig, the
+    real runtime path early-finalizes (reason == 'all_present') the moment
+    all expected learners report -- well before the (deliberately long) grace
+    window would have expired."""
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=3,
+        # A long grace window: if early-finalize did NOT fire, the round would
+        # take ~grace_window_ms to finalize. We assert it finalizes much
+        # faster, which is only possible via the all_present early path.
+        grace_window_ms=5_000,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        expected_learner_ids=("rack-0", "rack-1", "rack-2"),
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        frags = [
+            _build_fragment("rack-0", round_id=11, value=1.0),
+            _build_fragment("rack-1", round_id=11, value=2.0),
+            _build_fragment("rack-2", round_id=11, value=3.0),
+        ]
+        provider = _multi_learner_provider_factory(frags)
+        t0 = time.monotonic()
+        rt.outer_step_begin(round_id=11, fragment_provider=provider)
+        result = _collect_with_deadline(rt, timeout_s=3.0)
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+        assert result is not None, "outer-step did not complete within 3s"
+        assert result.round_id == 11
+        assert result.reason == "all_present", (
+            f"expected early-finalize reason 'all_present'; got {result.reason!r}"
+        )
+        assert sorted(result.learners_merged) == ["rack-0", "rack-1", "rack-2"]
+        assert result.learners_absent == []
+        # Must complete far faster than the 5s grace window (early-finalize).
+        assert elapsed_ms < 2_000.0, (
+            f"round took {elapsed_ms:.0f}ms; early-finalize should be far "
+            f"under the 5000ms grace window"
+        )
+        assert rt.outer_step_in_flight() is False
+    finally:
+        mend_shutdown(model)
+
+    # Diagnostics must record reason == 'all_present' and an empty absent list.
+    diag_files = list((tmp_path / "diag").glob("max_sdk_pid*.jsonl"))
+    assert diag_files, "diagnostics file not written"
+    events = [json.loads(line) for line in open(diag_files[0])]
+    collect_event = next(e for e in events if e["event"] == "outer_step_collect")
+    assert collect_event["reason"] == "all_present"
+    assert collect_event["learners_absent"] == []
+
+
+def test_eng5_learners_absent_populated_when_one_never_arrives(tmp_path):
+    """(b) An expected learner that never submits is reported in
+    MergeResult.learners_absent, and (since not all expected arrive) the round
+    finalizes via grace expiry rather than the all_present early path."""
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        # Quorum reachable by the two arriving learners so the round can still
+        # finalize after grace; the third is declared-but-absent.
+        quorum_min_learners=2,
+        grace_window_ms=30,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        expected_learner_ids=("rack-0", "rack-1", "rack-2"),
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        # Only rack-0 and rack-1 arrive; rack-2 is absent for round 12.
+        frags = [
+            _build_fragment("rack-0", round_id=12, value=1.0),
+            _build_fragment("rack-1", round_id=12, value=2.0),
+        ]
+        provider = _multi_learner_provider_factory(frags)
+        rt.outer_step_begin(round_id=12, fragment_provider=provider)
+        result = _collect_with_deadline(rt, timeout_s=3.0)
+
+        assert result is not None, "outer-step did not complete within 3s"
+        assert result.round_id == 12
+        assert sorted(result.learners_merged) == ["rack-0", "rack-1"]
+        # rack-2 never arrived and was never fail-slow-excluded -> absent.
+        assert result.learners_absent == ["rack-2"]
+        # Not all expected present, so the early path did not fire.
+        assert result.reason != "all_present"
+        assert result.reason in ("grace_expired", "quorum_satisfied")
+    finally:
+        mend_shutdown(model)
+
+    diag_files = list((tmp_path / "diag").glob("max_sdk_pid*.jsonl"))
+    assert diag_files
+    events = [json.loads(line) for line in open(diag_files[0])]
+    collect_event = next(e for e in events if e["event"] == "outer_step_collect")
+    assert collect_event["learners_absent"] == ["rack-2"]
+
+
+def _run_one_round_collect(config, *, round_id, frags, tmp_path, rank_id="rack-0/rank-0"):
+    """Spin up a full runtime with `config`, drive one outer round delivering
+    `frags`, and return the collected MergeResult. Used by the bit-exact test
+    to compare the roster vs no-roster paths under otherwise identical config."""
+    model = ToyLoraStyleModel()
+    mend_init(model, config, rank_id=rank_id)
+    rt = get_runtime(model)
+    try:
+        provider = _multi_learner_provider_factory(frags)
+        rt.outer_step_begin(round_id=round_id, fragment_provider=provider)
+        result = _collect_with_deadline(rt, timeout_s=3.0)
+        assert result is not None, "outer-step did not complete within 3s"
+        return result
+    finally:
+        mend_shutdown(model)
+
+
+def test_eng5_merged_delta_bit_identical_to_no_roster_path(tmp_path):
+    """(c) BIT-EXACT: the merged delta produced via the wired roster path
+    (early-finalize) is byte-for-byte identical to the merged delta produced by
+    the expected=None path (quorum then full grace) for the same arrivals.
+    Early-finalize merges the same fragment set grace-expiry would, just
+    sooner, so the loss is unchanged."""
+    # Identical fragment set for both runs (distinct learner_ids, distinct
+    # token weights and values so the token-weighted merge is non-trivial).
+    def make_frags(round_id):
+        return [
+            LearnerFragment(
+                learner_id="rack-0",
+                round_id=round_id,
+                params_delta=[torch.tensor([1.5, -2.25, 0.125])],
+                tokens_consumed=137,
+            ),
+            LearnerFragment(
+                learner_id="rack-1",
+                round_id=round_id,
+                params_delta=[torch.tensor([4.0, 8.0, -16.0])],
+                tokens_consumed=251,
+            ),
+            LearnerFragment(
+                learner_id="rack-2",
+                round_id=round_id,
+                params_delta=[torch.tensor([-0.5, 3.0, 7.75])],
+                tokens_consumed=89,
+            ),
+        ]
+
+    base_kwargs = dict(
+        quorum_min_learners=3,
+        grace_window_ms=200,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        token_weighted_merge=True,
+        sideband_peers=(),
+    )
+
+    # Path 1: roster declared -> world-size-aware early-finalize.
+    config_roster = MendConfig(
+        expected_learner_ids=("rack-0", "rack-1", "rack-2"),
+        diagnostics_dir=str(tmp_path / "diag_roster"),
+        **base_kwargs,
+    )
+    result_roster = _run_one_round_collect(
+        config_roster, round_id=21, frags=make_frags(21), tmp_path=tmp_path
+    )
+
+    # Path 2: no roster (the historical default path), same arrivals.
+    config_none = MendConfig(
+        expected_learner_ids=None,
+        diagnostics_dir=str(tmp_path / "diag_none"),
+        **base_kwargs,
+    )
+    result_none = _run_one_round_collect(
+        config_none, round_id=21, frags=make_frags(21), tmp_path=tmp_path
+    )
+
+    # The roster path early-finalized; the no-roster path waited out grace.
+    assert result_roster.reason == "all_present"
+    assert result_none.reason in ("grace_expired", "quorum_satisfied")
+    # Same learners merged in both.
+    assert result_roster.learners_merged == result_none.learners_merged
+
+    # BIT-EXACT: every merged tensor identical (not merely allclose).
+    assert len(result_roster.merged_delta) == len(result_none.merged_delta)
+    for t_roster, t_none in zip(result_roster.merged_delta, result_none.merged_delta):
+        assert t_roster.dtype == t_none.dtype
+        assert t_roster.shape == t_none.shape
+        assert torch.equal(t_roster, t_none), (
+            f"roster-path merged delta {t_roster} differs from no-roster "
+            f"path {t_none}; early-finalize must not change the merge math"
+        )
+
+
+def test_eng5_misdeclared_roster_falls_back_safely(tmp_path):
+    """SAFE FALLBACK: a per-round roster the syncer cannot reconcile with the
+    arriving fragments (here, a roster naming a learner that never arrives,
+    smaller-than-quorum handled at config time) must NOT hang or change the
+    merged result -- the round still finalizes (via grace) over the learners
+    that did arrive. This exercises the per-round override seam on
+    outer_step_begin and the syncer's own absent-but-finalize fallthrough."""
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=2,
+        grace_window_ms=30,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        # Config roster left None; we override per-round below.
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        frags = [
+            _build_fragment("rack-0", round_id=31, value=1.0),
+            _build_fragment("rack-1", round_id=31, value=3.0),
+        ]
+        provider = _multi_learner_provider_factory(frags)
+        # Declare a roster that names a never-arriving learner ("ghost").
+        rt.outer_step_begin(
+            round_id=31,
+            fragment_provider=provider,
+            expected_learner_ids=frozenset({"rack-0", "rack-1", "ghost"}),
+        )
+        result = _collect_with_deadline(rt, timeout_s=3.0)
+        assert result is not None, "misdeclared roster caused a hang"
+        assert sorted(result.learners_merged) == ["rack-0", "rack-1"]
+        # The never-arriving declared learner is surfaced, round still merges.
+        assert result.learners_absent == ["ghost"]
+        # token-weighted merge over the two arrivals: (100*1 + 100*3)/200 = 2.
+        assert torch.allclose(result.merged_delta[0], torch.tensor([2.0]))
+    finally:
+        mend_shutdown(model)
+
+
+def test_eng5_config_expected_learner_ids_validation():
+    """MendConfig.expected_learner_ids validation: default None is accepted;
+    a well-formed roster is accepted; empty-string, duplicate, and
+    quorum-exceeds-roster cases are rejected at config init."""
+    # Default None and a valid roster both construct fine.
+    assert MendConfig(quorum_min_learners=1, grace_window_ms=0).expected_learner_ids is None
+    ok = MendConfig(
+        quorum_min_learners=2,
+        grace_window_ms=0,
+        expected_learner_ids=("rack-0", "rack-1", "rack-2"),
+    )
+    assert ok.expected_learner_ids == ("rack-0", "rack-1", "rack-2")
+
+    # Empty-string entry rejected.
+    with pytest.raises(ValueError, match="non-empty strings"):
+        MendConfig(
+            quorum_min_learners=1,
+            grace_window_ms=0,
+            expected_learner_ids=("rack-0", ""),
+        )
+
+    # Duplicate entries rejected.
+    with pytest.raises(ValueError, match="duplicates"):
+        MendConfig(
+            quorum_min_learners=1,
+            grace_window_ms=0,
+            expected_learner_ids=("rack-0", "rack-0"),
+        )
+
+    # quorum_min_learners > len(roster) rejected (quorum unsatisfiable).
+    with pytest.raises(ValueError, match="cannot exceed"):
+        MendConfig(
+            quorum_min_learners=4,
+            grace_window_ms=0,
+            expected_learner_ids=("rack-0", "rack-1"),
+        )
+
+
+def test_eng5_config_default_path_unchanged_byte_for_byte(tmp_path):
+    """With expected_learner_ids unset (default None), the wired runtime path
+    is the historical quorum-then-full-grace behavior: no early-finalize, an
+    empty learners_absent, exactly as before ENG-5."""
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=2,
+        grace_window_ms=20,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        # expected_learner_ids left at default None.
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    assert config.expected_learner_ids is None
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        frags = [
+            _build_fragment("rack-a", round_id=41, value=1.0),
+            _build_fragment("rack-b", round_id=41, value=3.0),
+        ]
+        provider = _multi_learner_provider_factory(frags)
+        rt.outer_step_begin(round_id=41, fragment_provider=provider)
+        result = _collect_with_deadline(rt, timeout_s=3.0)
+        assert result is not None
+        # No roster -> never the early path; absent list stays empty.
+        assert result.reason != "all_present"
+        assert result.learners_absent == []
+        assert sorted(result.learners_merged) == ["rack-a", "rack-b"]
+    finally:
+        mend_shutdown(model)

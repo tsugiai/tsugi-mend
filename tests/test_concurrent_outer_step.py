@@ -301,3 +301,101 @@ def test_token_weighted_merge_is_preserved(event_loop_on_thread):
         time.sleep(0.005)
     assert result is not None
     assert torch.allclose(result.merged_delta[0], torch.tensor([2.5, 2.5, 2.5]))
+
+
+# ---------------------------------------------------------------------------
+# ENG-5: world-size-aware roster threaded into the orchestrator.
+# ---------------------------------------------------------------------------
+
+
+def _collect(orch, timeout_s: float = 2.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = orch.collect()
+        if result is not None:
+            return result
+        time.sleep(0.002)
+    return None
+
+
+def test_eng5_constructor_roster_early_finalizes_all_present(event_loop_on_thread):
+    """A constructor-supplied roster makes the orchestrator early-finalize
+    (reason == 'all_present') the moment every expected learner reports,
+    well under a deliberately long grace window."""
+    syncer = GraceWindowSyncer(quorum_min_learners=2, grace_window_ms=5_000)
+    orch = ConcurrentOuterStep(
+        syncer=syncer,
+        loop=event_loop_on_thread,
+        tick_interval_s=0.002,
+        expected_learner_ids=frozenset({"rack-a", "rack-b"}),
+    )
+    frags = [
+        _make_fragment("rack-a", round_id=1),
+        _make_fragment("rack-b", round_id=1),
+    ]
+    t0 = time.monotonic()
+    orch.submit_async(round_id=1, fragment_provider=_provider_from_list(frags))
+    result = _collect(orch, timeout_s=2.0)
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+    assert result is not None
+    assert result.reason == "all_present"
+    assert result.learners_absent == []
+    assert elapsed_ms < 1_500.0, (
+        f"round took {elapsed_ms:.0f}ms; early-finalize should be far under "
+        f"the 5000ms grace window"
+    )
+
+
+def test_eng5_per_round_override_takes_precedence(event_loop_on_thread):
+    """A per-round expected_learner_ids on submit_async overrides the
+    constructor default for that round."""
+    syncer = GraceWindowSyncer(quorum_min_learners=2, grace_window_ms=5_000)
+    orch = ConcurrentOuterStep(
+        syncer=syncer,
+        loop=event_loop_on_thread,
+        tick_interval_s=0.002,
+        # Constructor default names rack-a/rack-b, but we override per round.
+        expected_learner_ids=frozenset({"rack-a", "rack-b"}),
+    )
+    frags = [
+        _make_fragment("rack-x", round_id=1),
+        _make_fragment("rack-y", round_id=1),
+    ]
+    orch.submit_async(
+        round_id=1,
+        fragment_provider=_provider_from_list(frags),
+        expected_learner_ids=frozenset({"rack-x", "rack-y"}),
+    )
+    result = _collect(orch, timeout_s=2.0)
+    assert result is not None
+    assert result.reason == "all_present"
+    assert sorted(result.learners_merged) == ["rack-x", "rack-y"]
+    assert result.learners_absent == []
+
+
+def test_eng5_roster_smaller_than_quorum_falls_back(event_loop_on_thread):
+    """A per-round roster smaller than quorum_min cannot satisfy quorum and
+    would make start_round raise; the orchestrator must drop the roster and
+    take the quorum-then-grace path instead of failing the round."""
+    syncer = GraceWindowSyncer(quorum_min_learners=2, grace_window_ms=20)
+    orch = ConcurrentOuterStep(
+        syncer=syncer,
+        loop=event_loop_on_thread,
+        tick_interval_s=0.002,
+    )
+    frags = [
+        _make_fragment("rack-a", round_id=1),
+        _make_fragment("rack-b", round_id=1),
+    ]
+    # Roster of size 1 < quorum 2: unsatisfiable -> safe fallback to None path.
+    orch.submit_async(
+        round_id=1,
+        fragment_provider=_provider_from_list(frags),
+        expected_learner_ids=frozenset({"rack-a"}),
+    )
+    result = _collect(orch, timeout_s=2.0)
+    assert result is not None, "fallback path failed to finalize"
+    assert sorted(result.learners_merged) == ["rack-a", "rack-b"]
+    # Fallback uses expected=None -> no all_present, empty absent list.
+    assert result.reason != "all_present"
+    assert result.learners_absent == []
