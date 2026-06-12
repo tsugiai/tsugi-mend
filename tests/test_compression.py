@@ -6,13 +6,18 @@ import torch
 
 from tsugi_mend.compression import (
     PowerSGDState,
+    Quant4State,
     _bitwise_nonzero_mask,
     apply_compression,
     int8_quantize_delta,
     powersgd_compress_delta,
+    quant4_compress_delta,
+    quant4_decode,
+    quant4_encode,
     sparse_delta_decode,
     sparse_delta_encode,
 )
+from tsugi_mend.config import MendConfig
 
 
 def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor) -> None:
@@ -393,3 +398,208 @@ def test_apply_compression_powersgd_default_state_is_fresh():
     out2 = apply_compression(tensors, mode="powersgd")
     assert out1[0].shape == tensors[0].shape
     assert out2[0].shape == tensors[0].shape
+
+
+# ----------------------------------------------------------------------
+# quant4: symmetric 4-bit block-wise quantization with error feedback
+# (LOSSY when enabled; strictly opt-in; default "none" stays bit-exact)
+# ----------------------------------------------------------------------
+
+
+def test_apply_compression_none_is_bit_exact_with_quant4_available():
+    """Off-path proof: with quant4 merely AVAILABLE (mode registered,
+    state constructed), mode='none' output is torch.equal-identical to
+    the input. The default path is byte-for-byte untouched."""
+    torch.manual_seed(7)
+    _ = Quant4State()  # quant4 exists; it must not perturb the none path
+    tensors = [
+        torch.randn(64, 32),
+        torch.randn(513) * 1e-4,
+        torch.randn(16, 8).to(torch.bfloat16),
+        torch.randn(16, 8).to(torch.float16),
+    ]
+    out = apply_compression(tensors, mode="none")
+    assert len(out) == len(tensors)
+    for a, b in zip(tensors, out):
+        assert torch.equal(b, a)
+        assert b is not a  # a new tensor, not an alias of the input
+    # Special values, incl. NaN where torch.equal is unsuitable: compare
+    # raw bytes instead.
+    special = torch.tensor(
+        [0.0, -0.0, float("inf"), float("-inf"), float("nan")],
+        dtype=torch.float32,
+    )
+    special_out = apply_compression([special], mode="none")[0]
+    _assert_same_bits(special_out, special)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(3, 5), (2, 3, 4), (257,), (128,), (1,)])
+def test_quant4_round_trip_shape_and_dtype(dtype, shape):
+    torch.manual_seed(8)
+    t = (torch.randn(shape) * 0.01).to(dtype)
+    payload = quant4_encode(t)
+    out = quant4_decode(payload)
+    assert out.shape == t.shape
+    assert out.dtype == t.dtype
+
+
+def test_quant4_payload_packs_two_codes_per_byte():
+    torch.manual_seed(8)
+    t = torch.randn(300)  # zero-pads to 384 = 3 blocks of 128
+    payload = quant4_encode(t)
+    assert payload.packed.dtype == torch.uint8
+    assert payload.packed.numel() == 384 // 2
+    assert payload.scales.numel() == 3
+    assert payload.numel == 300
+    assert payload.shape == (300,)
+
+
+def test_quant4_error_bounded_by_block_step_size():
+    """Round-trip error is bounded per block by the block's step size
+    (round-to-nearest actually achieves half the step)."""
+    torch.manual_seed(9)
+    block_size = 128
+    t = torch.randn(4, 256) * 0.01  # 1024 elements = 8 blocks of 128
+    payload = quant4_encode(t, block_size=block_size)
+    out = quant4_decode(payload)
+    err_blocks = (out - t).reshape(-1, block_size).abs()
+    step = payload.scales.unsqueeze(1)  # per-block step size
+    assert bool((err_blocks <= step * 0.5 + 1e-7).all())
+    # And a fortiori the brief-level bound: error <= the step size.
+    assert bool((err_blocks <= step).all())
+
+
+def test_quant4_nonfinite_policy_pinned():
+    """Pinned policy: NaN/+inf/-inf encode as 0 and are excluded from the
+    block scale, so they neither crash nor poison finite neighbors;
+    -0.0 decodes as +0.0 (sign of zero not preserved; lossy mode)."""
+    t = torch.zeros(256, dtype=torch.float32)
+    t[0] = float("nan")
+    t[1] = float("inf")
+    t[2] = float("-inf")
+    t[3] = -0.0
+    t[4] = 0.5
+    t[5] = -0.5
+    payload = quant4_encode(t, block_size=128)
+    out = quant4_decode(payload)
+    assert torch.isfinite(out).all()
+    assert out[0].item() == 0.0
+    assert out[1].item() == 0.0
+    assert out[2].item() == 0.0
+    assert out[3].item() == 0.0
+    assert not bool(torch.signbit(out[3]))  # -0.0 came back as +0.0
+    # Finite neighbors keep the normal bound: block scale derives from
+    # max |finite| = 0.5, not from inf.
+    step = payload.scales[0].item()
+    assert step == pytest.approx(0.5 / 7.0)
+    assert out[4].item() == pytest.approx(0.5, abs=step)
+    assert out[5].item() == pytest.approx(-0.5, abs=step)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_quant4_compress_delta_handles_nonfinite_without_crash(dtype):
+    state = Quant4State()
+    base = [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 1.0, -1.0, 0.25]
+    t = torch.tensor(base * 32, dtype=dtype)
+    out = quant4_compress_delta(t, state=state, key="k")
+    assert out.shape == t.shape
+    assert out.dtype == t.dtype
+    assert torch.isfinite(out.to(torch.float32)).all()
+    # Non-finites are sanitized BEFORE the EF update, so the persistent
+    # residual stays finite and cannot poison later steps.
+    assert torch.isfinite(state.residuals["k"]).all()
+    # A second step with the carried residual also stays finite.
+    out2 = quant4_compress_delta(t, state=state, key="k")
+    assert torch.isfinite(out2.to(torch.float32)).all()
+
+
+def test_quant4_error_feedback_shrinks_mean_reconstruction_error():
+    """EF contract, asserted directly and deterministically: over repeated
+    steps on a FIXED delta, the mean of the EF-corrected outputs converges
+    to the true delta (the carried residual telescopes, leaving an error
+    of ||r_T|| / T), while without EF the mean error stays pinned at the
+    one-shot quantization error."""
+    torch.manual_seed(10)
+    g = torch.randn(64, 32) * 0.01
+    steps = 8
+
+    ef_state = Quant4State()
+    ef_sum = torch.zeros_like(g)
+    for _ in range(steps):
+        ef_sum += quant4_compress_delta(g, state=ef_state, key="layer.0")
+    ef_mean_err = (ef_sum / steps - g).norm().item()
+
+    no_ef_sum = torch.zeros_like(g)
+    for _ in range(steps):
+        # A fresh state per call discards the residual = no error feedback.
+        no_ef_sum += quant4_compress_delta(g, state=Quant4State(), key="layer.0")
+    no_ef_mean_err = (no_ef_sum / steps - g).norm().item()
+
+    assert no_ef_mean_err > 0  # quantization is genuinely lossy on this input
+    assert ef_mean_err < no_ef_mean_err
+    # The EF mean error shrinks like ~1/steps; demand at least a 2x win so
+    # the assertion is meaningful rather than a tie-break.
+    assert ef_mean_err < no_ef_mean_err / 2
+
+
+def test_quant4_state_is_bounded_one_residual_per_key():
+    torch.manual_seed(11)
+    state = Quant4State()
+    g = torch.randn(256) * 0.1
+    for _ in range(5):
+        quant4_compress_delta(g, state=state, key="a")
+        quant4_compress_delta(g, state=state, key="b")
+    # Bounded: exactly one residual tensor per key, no per-step growth.
+    assert set(state.residuals.keys()) == {"a", "b"}
+    assert state.residuals["a"].shape == g.shape
+    state.reset(key="a")
+    assert set(state.residuals.keys()) == {"b"}
+    state.reset()
+    assert state.residuals == {}
+
+
+def test_quant4_handles_empty_tensor():
+    t = torch.empty(0)
+    payload = quant4_encode(t)
+    out = quant4_decode(payload)
+    assert out.numel() == 0
+    assert out.shape == t.shape
+    state = Quant4State()
+    out2 = quant4_compress_delta(t, state=state, key="e")
+    assert out2.numel() == 0
+
+
+def test_quant4_rejects_bad_block_size():
+    with pytest.raises(ValueError, match="block_size"):
+        quant4_encode(torch.randn(8), block_size=3)
+    with pytest.raises(ValueError, match="block_size"):
+        quant4_encode(torch.randn(8), block_size=0)
+
+
+def test_apply_compression_quant4_round_trip_and_state():
+    torch.manual_seed(12)
+    tensors = [torch.randn(64, 32) * 0.01, torch.randn(300) * 0.01]
+    state = Quant4State()
+    out = apply_compression(
+        tensors, mode="quant4", quant4_state=state, key_prefix="layer.0",
+    )
+    assert len(out) == len(tensors)
+    for a, b in zip(tensors, out):
+        assert b.shape == a.shape
+        assert b.dtype == a.dtype
+        assert (a - b).abs().max().item() > 0  # lossy: not bit-identical
+    assert "layer.0.0" in state.residuals
+    assert "layer.0.1" in state.residuals
+
+
+def test_apply_compression_unknown_mode_message_lists_quant4():
+    with pytest.raises(ValueError, match="none, int8, powersgd, sparse, quant4"):
+        apply_compression([torch.randn(4)], mode="quant5")  # type: ignore[arg-type]
+
+
+def test_mend_config_accepts_quant4_mode():
+    cfg = MendConfig(outer_step_compression_mode="quant4")
+    assert cfg.outer_step_compression_mode == "quant4"
+    with pytest.raises(ValueError, match="quant4"):
+        MendConfig(outer_step_compression_mode="quant3")

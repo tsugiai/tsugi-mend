@@ -154,8 +154,14 @@ class MendConfig:
     # arXiv:1905.13727); convergence-preserving by design. "sparse"
     # applies a lossless index+value delta codec with dense fallback, so
     # it preserves exact tensor values but only reduces communication when
-    # the delta is genuinely element-sparse. Compression modes other than
-    # "none" are experimental and off by default.
+    # the delta is genuinely element-sparse. "quant4" applies symmetric
+    # 4-bit block-wise quantization with a persistent per-key
+    # error-feedback residual; it is LOSSY when enabled (motivated by
+    # Streaming DiLoCo, arXiv:2501.18512, which reports 4-bit outer
+    # gradients at iso-quality on the paper's workloads; the paper's
+    # claim, not a guarantee). Compression modes other than "none" are
+    # experimental and off by default; "none" remains the bit-exact
+    # default.
     outer_step_compression_mode: str = "none"
     # PowerSGD low-rank approximation rank. Higher r reduces compression
     # but improves accuracy. PowerSGD paper recommends r=4 as default.
@@ -443,10 +449,12 @@ class MendConfig:
                 f"'constant', 'bimodal', 'long_tail'; "
                 f"got {self.simulated_merge_delay_distribution!r}"
             )
-        if self.outer_step_compression_mode not in ("none", "int8", "powersgd", "sparse"):
+        if self.outer_step_compression_mode not in (
+            "none", "int8", "powersgd", "sparse", "quant4",
+        ):
             raise ValueError(
                 f"outer_step_compression_mode must be one of "
-                f"'none', 'int8', 'powersgd', 'sparse'; "
+                f"'none', 'int8', 'powersgd', 'sparse', 'quant4'; "
                 f"got {self.outer_step_compression_mode!r}"
             )
         if self.outer_step_compression_powersgd_rank < 1:

@@ -31,7 +31,7 @@
 | `async_tp.enable_async_tp` | PyTorch / TorchTitan async-TP, September 2024 | best-effort enabling of TorchTitan's intra-node async-TP path |
 | `failslow.FailSlowDetector` | FALCON, arXiv:2410.12588 | sliding-window z-score detection of slow ranks |
 | `autotuner.RuntimeAutotuner` | Guard (arXiv:2605.17879) online performance monitoring; "From Detection to Recovery" (arXiv:2605.09370) operational recovery-wait analysis | online (continuous) adaptation of the fail-slow detection threshold and the grace-window wall-clock wait from the observed step-time stream |
-| `compression.apply_compression` | INT8 quantization, PowerSGD (arXiv:1905.13727), SparseRL-Sync (arXiv:2605.07330) | optional outer-step delta transforms; `none` and `sparse` are lossless, while `int8` and `powersgd` are lossy opt-in modes |
+| `compression.apply_compression` | INT8 quantization, PowerSGD (arXiv:1905.13727), SparseRL-Sync (arXiv:2605.07330), Streaming DiLoCo 4-bit outer gradients (arXiv:2501.18512) | optional outer-step delta transforms; `none` and `sparse` are lossless, while `int8`, `powersgd`, and `quant4` are lossy opt-in modes |
 | `topology.detect` | generic engineering | rack classification from NCCL_TOPO_FILE or hostname grouping |
 | `sideband.Sideband` | generic engineering | low-bandwidth TCP heartbeat carrying step-id / vector-clock / queue-depth / health metadata |
 | `diagnostics.DiagnosticsWriter` | generic engineering | append-only JSONL event log |
@@ -81,6 +81,8 @@ The effective values and the steps on which they changed are surfaced as `auto_t
 The `sparse` mode is different: it is lossless. Each tensor is encoded as flattened int64 indices plus exact values only when that sparse payload is estimated to be smaller than the dense tensor payload; otherwise it falls back to dense. Decoding reconstructs the original dense tensor bit-for-bit before merge, including negative zero and non-finite values.
 
 This mode only helps when the transmitted delta is genuinely element-sparse, such as adapter-heavy or sparse-update regimes. The default DiLoCo-style `params_delta` after many inner optimizer steps is typically dense, so the sparse codec is expected to choose dense fallback there rather than reduce communication.
+
+The `quant4` mode is symmetric 4-bit block-wise quantization of the outer delta with an error-feedback residual: blocks of 128 elements share one fp32 scale (max-abs / 7, codes in [-7, 7], two codes packed per byte), and each key's quantization error is carried into the next outer step's input instead of being dropped. **quant4 is LOSSY when enabled** and is strictly opt-in; `none` remains the bit-exact default and is byte-for-byte unaffected by quant4 being available. Non-finite inputs (NaN, +/-inf) encode as 0 and are excluded from the block scale (pinned policy; see the `quant4_encode` docstring). The motivation is Streaming DiLoCo (arXiv:2501.18512), which reports that 4-bit quantization of outer gradients holds loss at iso-quality while reducing cross-rack bandwidth; that is the paper's claim on the paper's workloads, not a result re-validated here.
 
 ## File-by-file reading order
 
