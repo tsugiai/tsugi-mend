@@ -14,6 +14,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   a stable contract, so no deprecation shim is warranted.
 - Optimized the lossless sparse-delta bitwise nonzero mask while preserving
   exact raw-byte semantics for negative zero, non-finite values, and subnormals.
+- Under-declared expected learner rosters now disable roster-aware
+  early-finalize in place when an unexpected non-fail-slow learner arrives.
+  Already-accepted fragments, fail-slow state, and grace-window timing are
+  preserved, and `outer_step_collect` reports the fallback as
+  `roster_fallback`.
 
 ### Fixed
 

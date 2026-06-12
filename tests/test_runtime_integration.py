@@ -925,3 +925,65 @@ def test_eng5_config_default_path_unchanged_byte_for_byte(tmp_path):
         assert sorted(result.learners_merged) == ["rack-a", "rack-b"]
     finally:
         mend_shutdown(model)
+
+
+def test_eng12_underdeclared_roster_disables_in_place_via_runtime(tmp_path):
+    """ENG-12: an unexpected learner disables roster awareness in place on
+    the live runtime path and preserves the roster-None merged bits."""
+
+    def make_frags(round_id):
+        return [
+            _build_fragment("rack-0", round_id=round_id, value=1.0),
+            _build_fragment("rack-2", round_id=round_id, value=5.0),
+            _build_fragment("rack-1", round_id=round_id, value=3.0),
+            _build_fragment("rack-3", round_id=round_id, value=7.0),
+        ]
+
+    base_kwargs = dict(
+        quorum_min_learners=2,
+        grace_window_ms=30,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        sideband_peers=(),
+    )
+    config_none = MendConfig(
+        diagnostics_dir=str(tmp_path / "diag_none"),
+        **base_kwargs,
+    )
+    none_result = _run_one_round_collect(
+        config_none,
+        round_id=61,
+        frags=make_frags(61),
+        tmp_path=tmp_path,
+    )
+
+    # The under-declared roster rides in on the ENG-5 config knob; rack-2 /
+    # rack-3 arrive outside it and must trip the in-place fallback.
+    config_fallback = MendConfig(
+        diagnostics_dir=str(tmp_path / "diag_fallback"),
+        expected_learner_ids=("rack-0", "rack-1"),
+        **base_kwargs,
+    )
+    fallback_result = _run_one_round_collect(
+        config_fallback,
+        round_id=62,
+        frags=make_frags(62),
+        tmp_path=tmp_path,
+    )
+
+    assert fallback_result.roster_fallback is True
+    assert none_result.roster_fallback is False
+    assert fallback_result.reason == none_result.reason == "grace_expired"
+    assert fallback_result.learners_merged == none_result.learners_merged
+    assert len(fallback_result.merged_delta) == len(none_result.merged_delta)
+    for fallback_tensor, none_tensor in zip(
+        fallback_result.merged_delta, none_result.merged_delta
+    ):
+        assert torch.equal(fallback_tensor, none_tensor)
+
+    diag_files = list((tmp_path / "diag_fallback").glob("max_sdk_pid*.jsonl"))
+    assert diag_files
+    events = [json.loads(line) for line in open(diag_files[0])]
+    collect_event = next(e for e in events if e["event"] == "outer_step_collect")
+    assert collect_event["roster_fallback"] is True

@@ -25,6 +25,7 @@ this module.
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterable, Optional
@@ -34,6 +35,9 @@ from torch import Tensor
 
 if TYPE_CHECKING:
     from random import Random
+
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -85,6 +89,11 @@ class MergeResult:
             the round was started without expected-learner awareness (the
             default), or when the finalize reason is "all_present". Disjoint
             from both learners_merged and learners_excluded.
+        roster_fallback: True when expected-roster awareness was disabled for
+            this round because a non-fail-slow learner arrived outside the
+            declared roster. Merge math and already-accepted fragments are
+            preserved; the round continues under the historical roster-None
+            quorum-then-grace law.
     """
     round_id: int
     merged_delta: list[Tensor]
@@ -93,6 +102,7 @@ class MergeResult:
     elapsed_grace_ms: float
     reason: str  # "quorum_satisfied", "grace_expired", "all_present"
     learners_absent: list[str] = field(default_factory=list)
+    roster_fallback: bool = False
 
 
 def token_weighted_merge(fragments: Iterable[LearnerFragment]) -> list[Tensor]:
@@ -162,6 +172,7 @@ class _SyncerState:
     # soon as every expected, non-fail-slow learner has reported AND quorum is
     # met, and it can report which expected learners were absent at finalize.
     expected_learner_ids: Optional[set[str]] = None
+    roster_fallback: bool = False
 
 
 class GraceWindowSyncer:
@@ -325,6 +336,17 @@ class GraceWindowSyncer:
             return None
         if fragment.round_id != self._state.round_id:
             return None  # stale or future round; ignore
+        expected = self._state.expected_learner_ids
+        if expected is not None and fragment.learner_id not in expected:
+            _LOG.warning(
+                "GraceWindowSyncer round %s: learner %r arrived outside the "
+                "declared expected_learner_ids roster; disabling roster-aware "
+                "early-finalize for this round and using the quorum-then-grace path",
+                self._state.round_id,
+                fragment.learner_id,
+            )
+            self._state.expected_learner_ids = None
+            self._state.roster_fallback = True
         # Stamp arrival time at the syncer.
         if fragment.arrival_time_s == 0.0:
             fragment.arrival_time_s = self._clock()
@@ -513,6 +535,7 @@ class GraceWindowSyncer:
             elapsed_grace_ms=elapsed_grace_ms,
             reason=reason,
             learners_absent=learners_absent,
+            roster_fallback=self._state.roster_fallback,
         )
         self._state = None
         return result
