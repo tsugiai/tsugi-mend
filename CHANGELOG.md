@@ -15,6 +15,17 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Optimized the lossless sparse-delta bitwise nonzero mask while preserving
   exact raw-byte semantics for negative zero, non-finite values, and subnormals.
 
+### Fixed
+
+- Corrected `MergeResult.learners_excluded` so it reports only fragments
+  actually excluded from the merge when a learner is marked fail-slow after
+  its fragment was already accepted.
+
+### Tests
+
+- Added deterministic Hypothesis coverage for `GraceWindowSyncer` roster
+  bit-identity, liveness, and diagnostic subset invariants.
+
 ## [0.1.4] - 2026-06-10
 
 ### Added

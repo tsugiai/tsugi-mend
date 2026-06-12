@@ -177,6 +177,39 @@ def test_syncer_failslow_exclusion_drops_submissions():
     assert "slow_rank" in out.learners_excluded
 
 
+def test_syncer_failslow_after_accept_keeps_merge_and_excludes_only_dropped():
+    """Marking a learner fail-slow after accepting its fragment must not
+    retract that fragment. The diagnostic should list only actually dropped
+    fragments, so merged and excluded are disjoint."""
+
+    def run(mark_after_accept: bool):
+        clock = FakeClock()
+        sync = GraceWindowSyncer(
+            quorum_min_learners=2,
+            grace_window_ms=100,
+            clock=clock,
+        )
+        sync.start_round(round_id=6)
+        assert sync.submit(_mk_fragment("slow_rank", 6, [1.0, -2.0], tokens=100)) is None
+        assert sync.submit(_mk_fragment("fast_rank", 6, [3.0, 6.0], tokens=100)) is None
+        if mark_after_accept:
+            sync.mark_failslow("slow_rank")
+        clock.advance_ms(200)
+        out = sync.tick()
+        assert out is not None
+        return out
+
+    control = run(mark_after_accept=False)
+    marked = run(mark_after_accept=True)
+
+    assert marked.learners_merged == control.learners_merged == ["fast_rank", "slow_rank"]
+    assert marked.learners_excluded == []
+    assert set(marked.learners_excluded).isdisjoint(marked.learners_merged)
+    assert len(marked.merged_delta) == len(control.merged_delta)
+    for marked_tensor, control_tensor in zip(marked.merged_delta, control.merged_delta):
+        assert torch.equal(marked_tensor, control_tensor)
+
+
 def test_syncer_ignores_stale_round_fragments():
     sync = GraceWindowSyncer(quorum_min_learners=2, grace_window_ms=100)
     sync.start_round(round_id=10)
