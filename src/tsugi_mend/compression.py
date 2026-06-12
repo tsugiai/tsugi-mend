@@ -278,9 +278,24 @@ def _bitwise_nonzero_mask(tensor: Tensor) -> Tensor:
     """
     if tensor.numel() == 0:
         return torch.empty(0, dtype=torch.bool, device=tensor.device)
-    element_size = tensor.element_size()
-    byte_view = tensor.detach().contiguous().view(torch.uint8)
-    per_element = byte_view.reshape(tensor.numel(), element_size)
+    detached = tensor.detach().contiguous()
+    element_size = detached.element_size()
+    int_dtype_by_size = {
+        1: torch.int8,
+        2: torch.int16,
+        4: torch.int32,
+        8: torch.int64,
+    }
+    int_dtype = int_dtype_by_size.get(element_size)
+    if int_dtype is not None:
+        try:
+            return detached.reshape(-1).view(int_dtype).ne(0)
+        except RuntimeError:
+            # Fall back to the byte-wise reference path for uncommon tensor
+            # layouts or dtypes whose storage cannot be reinterpreted directly.
+            pass
+    byte_view = detached.view(torch.uint8)
+    per_element = byte_view.reshape(detached.numel(), element_size)
     return per_element.ne(0).any(dim=1)
 
 
