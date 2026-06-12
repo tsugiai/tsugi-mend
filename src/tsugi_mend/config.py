@@ -14,6 +14,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from tsugi_mend.autotuner import (
+    DEFAULT_DRIFT_BASELINE_ALPHA,
+    DEFAULT_DRIFT_CUSUM_SLACK,
+    DEFAULT_DRIFT_CUSUM_THRESHOLD,
+    DEFAULT_DRIFT_EWMA_ALPHA,
+    DEFAULT_SUSTAIN_WINDOWS,
+)
 from tsugi_mend.sideband import (
     DEFAULT_SIDEBAND_INBOUND_READ_TIMEOUT_S,
     DEFAULT_SIDEBAND_MAX_INBOUND_CONNECTIONS,
@@ -249,6 +256,37 @@ class MendConfig:
     # widens the grace window. Both must be >= 0.
     auto_tune_cov_gain: float = 4.0
     auto_tune_grace_gain: float = 1.0
+    # --- v2 observe-only signals (autotuner.RuntimeAutotuner) ---
+    # Sustained peer-relative gate: an adaptation move (raising the z-score
+    # threshold, widening the grace window) only applies after its
+    # triggering condition has held for this many consecutive windows'
+    # worth of evaluations, i.e. (K - 1) * auto_tune_runtime_window_steps
+    # + 1 consecutive deviating evaluations. Multi-window sustained-
+    # deviation detection-side pattern from Guard (arXiv:2605.17879); the
+    # mitigation half (job restart) is deliberately not adopted. The
+    # default K = 1 applies moves immediately and preserves the v1
+    # control-law behavior byte-for-byte; K >= 2 provably suppresses
+    # single-sample blips (a lone sample deviates the rolling-window
+    # statistics for at most one window's worth of evaluations).
+    auto_tune_sustain_windows: int = DEFAULT_SUSTAIN_WINDOWS
+    # Per-learner EWMA/CUSUM drift classifier (classical statistical
+    # process control: EWMA + one-sided CUSUM control charts). FLAG-ONLY
+    # by construction: the flag is surfaced on AutotuneDecision and as the
+    # "auto_tune_drift_flag" diagnostic event; it never feeds exclusion,
+    # cadence, or tensors. Fast-EWMA smoothing factor for the per-learner
+    # latency level (in (0, 1]; larger = faster tracking).
+    auto_tune_drift_ewma_alpha: float = DEFAULT_DRIFT_EWMA_ALPHA
+    # Slow-EWMA smoothing factor for the single-stream self-baseline the
+    # CUSUM accumulates against when no peer streams are observed. Must be
+    # in (0, 1] and is typically much smaller than the fast alpha so a
+    # slow ramp opens a gap the CUSUM can integrate.
+    auto_tune_drift_baseline_alpha: float = DEFAULT_DRIFT_BASELINE_ALPHA
+    # One-sided CUSUM slack allowance (in robust standard-deviation
+    # units): per-observation deviation below this is not accumulated.
+    auto_tune_drift_cusum_slack: float = DEFAULT_DRIFT_CUSUM_SLACK
+    # One-sided CUSUM flag threshold (in robust standard-deviation
+    # units): the learner is flagged while its accumulator exceeds this.
+    auto_tune_drift_cusum_threshold: float = DEFAULT_DRIFT_CUSUM_THRESHOLD
 
     # ------------------------------------------------------------------
     # Rack-aware topology
@@ -476,4 +514,29 @@ class MendConfig:
         if self.auto_tune_grace_gain < 0:
             raise ValueError(
                 f"auto_tune_grace_gain must be >= 0; got {self.auto_tune_grace_gain}"
+            )
+        if self.auto_tune_sustain_windows < 1:
+            raise ValueError(
+                f"auto_tune_sustain_windows must be >= 1; "
+                f"got {self.auto_tune_sustain_windows}"
+            )
+        if not (0.0 < self.auto_tune_drift_ewma_alpha <= 1.0):
+            raise ValueError(
+                f"auto_tune_drift_ewma_alpha must be in (0, 1]; "
+                f"got {self.auto_tune_drift_ewma_alpha}"
+            )
+        if not (0.0 < self.auto_tune_drift_baseline_alpha <= 1.0):
+            raise ValueError(
+                f"auto_tune_drift_baseline_alpha must be in (0, 1]; "
+                f"got {self.auto_tune_drift_baseline_alpha}"
+            )
+        if self.auto_tune_drift_cusum_slack < 0:
+            raise ValueError(
+                f"auto_tune_drift_cusum_slack must be >= 0; "
+                f"got {self.auto_tune_drift_cusum_slack}"
+            )
+        if self.auto_tune_drift_cusum_threshold <= 0:
+            raise ValueError(
+                f"auto_tune_drift_cusum_threshold must be > 0; "
+                f"got {self.auto_tune_drift_cusum_threshold}"
             )
