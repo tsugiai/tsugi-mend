@@ -22,6 +22,15 @@ def test_defaults_construct():
     assert c.diagnostics_dir is None
 
 
+def test_config_rejects_positional_args():
+    constructor = MendConfig
+    with pytest.raises(TypeError, match="positional argument"):
+        constructor(1)
+
+    c = MendConfig(quorum_min_learners=1)
+    assert c.quorum_min_learners == 1
+
+
 def test_quorum_must_be_positive():
     with pytest.raises(ValueError, match="quorum_min_learners"):
         MendConfig(quorum_min_learners=0)
