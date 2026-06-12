@@ -15,7 +15,7 @@ This mirrors the tsugi_kpool facade pattern.
 """
 from tsugi_mend.config import MendConfig
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 
 def mend_init(*args, **kwargs):  # type: ignore[no-untyped-def]

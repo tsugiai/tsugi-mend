@@ -5,7 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.5] - 2026-06-12
+
+Compatibility notes for this release:
+
+- `MendConfig` construction is now **keyword-only**; external positional
+  construction (never a stable contract) now raises `TypeError`.
+- `MergeResult.learners_excluded` now reports only learners actually excluded
+  from the merge; merged tensors are unchanged, but diagnostics consumers that
+  expected the old over-reporting (a learner marked fail-slow AFTER its
+  fragment merged) should update.
+- All new capabilities in this release are opt-in (`incremental_collect`,
+  `outer_step_compression_mode="quant4"` — **lossy when enabled**) or
+  observe-only (autotuner v2 signals); the default mode remains bit-exact and
+  byte-identical to 0.1.4. Some new autotuner knobs are not yet threaded
+  through the runtime (tracked follow-up).
 
 ### Added
 
