@@ -21,7 +21,7 @@ from tsugi_mend.sideband import (
 )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class MendConfig:
     """tsugiai-mend-sdk configuration.
 
