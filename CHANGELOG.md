@@ -47,6 +47,39 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
     internally (defaults apply on that path, preserving current behavior);
     the one-line runtime wiring plus peer-stream feeding from the sideband
     is tracked as follow-up work.
+- Straggler-aware canonical-order incremental collect for
+  `reducer.GraceWindowSyncer` (opt-in, default OFF; idea adapted from
+  straggler-aware collective scheduling, arXiv:2505.23523, to the
+  fragment/merge layer). New constructor flag
+  `GraceWindowSyncer(..., incremental_collect=True)` and matching config knob
+  `MendConfig.incremental_collect` (default `False`; consumed when the syncer
+  is built directly -- runtime/`ConcurrentOuterStep` threading is a separate
+  follow-up). When on, each accepted fragment is folded into a float64
+  running accumulation AT ARRIVAL TIME (during the grace-window wait) instead
+  of doing all merge arithmetic at finalize, so under a laggard learner only
+  the laggard's own term plus the final divide-and-cast remain on the
+  critical path after the last arrival. **Bit-exact by construction:** the
+  accumulation replays the exact op sequence, in the exact effective order
+  (dict insertion order = first-arrival order), of the untouched
+  `token_weighted_merge` / `uniform_merge` functions, and the round falls
+  back to the frozen finalize-time merge whenever order-identity cannot be
+  proven (fragment resubmission, parameter-count mismatch, mid-accumulation
+  error, non-positive token total, or a post-submit fragment
+  rebinding/in-place mutation caught by a finalize-time integrity check on
+  object identity + PyTorch tensor version counters). Fallback reproduces
+  default-path results, error messages, and error timing exactly. New
+  read-only observability property
+  `GraceWindowSyncer.last_merge_used_incremental` (`True` = accumulation
+  used, `False` = mode on but the round fell back, `None` = mode off).
+  Ordering-proof tests in `tests/test_incremental_collect.py` assert
+  `torch.equal` AND raw-bit identity (integer views, catching `-0.0` vs
+  `+0.0`) against the default path across arrival orders (canonical,
+  reverse, random permutations, laggard-last, laggard-first), learner counts
+  (2/3/4/8), both merge variants, and fp32/bf16 adversarial payloads
+  (denormals, large/small magnitude mix, `-0.0`), plus `MergeResult`-field
+  equality and anti-vacuity assertions that the incremental path (not a
+  silent fallback) produced each proof cell. Default-OFF code path is
+  byte-for-byte the previous behavior.
 
 ### Changed
 

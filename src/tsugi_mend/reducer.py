@@ -158,6 +158,55 @@ def uniform_merge(fragments: Iterable[LearnerFragment]) -> list[Tensor]:
 
 
 @dataclass
+class _FragmentSnapshot:
+    """What `_inc_observe` saw when it folded one fragment into the running
+    accumulation. Verified against the live fragment store at finalize: the
+    frozen merge functions read the fragments AT FINALIZE TIME, so if a caller
+    rebinds or mutates a fragment after submit, the baked-in accumulation no
+    longer reproduces the frozen result and the round must fall back.
+    """
+    learner_id: str
+    # Identity of the LearnerFragment object that was accumulated.
+    fragment: LearnerFragment
+    # `tokens_consumed` as accumulated (the frozen path re-reads it).
+    tokens_consumed: int
+    # Identity of each accumulated tensor (catches list rebinding).
+    tensors: tuple[Tensor, ...]
+    # PyTorch version counters at accumulation time (catches API-level
+    # in-place mutation, e.g. `t.add_(...)`; raw-storage pokes that bypass
+    # the version counter, e.g. via `.data`, are documented as out of scope).
+    tensor_versions: tuple[int, ...]
+
+
+@dataclass
+class _IncrementalCollectState:
+    """Running state for the opt-in straggler-aware incremental collect.
+
+    Holds the float64 prefix accumulation built up fragment-by-fragment at
+    arrival time. The accumulation replays, term by term and in the same
+    effective order, the exact op sequence `token_weighted_merge` /
+    `uniform_merge` would execute over `fragments.values()` at finalize, so
+    the finished accumulation is bit-identical to the frozen path's internal
+    accumulator by construction (dict insertion order IS the frozen
+    functions' effective order).
+    """
+    # One float64 accumulator per parameter, in canonical parameter order.
+    acc: list[Tensor]
+    # The first-arrived fragment's per-parameter dtypes; the frozen path
+    # casts the merged result back to `frags[0].params_delta[p].dtype`.
+    first_dtypes: list[torch.dtype]
+    # Parameter count pinned by the first-arrived fragment.
+    n_params: int
+    # Running sum of `tokens_consumed` (token-weighted divisor).
+    total_tokens: int
+    # Number of fragments folded into the accumulation so far.
+    count: int
+    # Per-fragment snapshots in accumulation (= dict insertion) order,
+    # verified at finalize (see _FragmentSnapshot).
+    snapshots: list[_FragmentSnapshot] = field(default_factory=list)
+
+
+@dataclass
 class _SyncerState:
     """Mutable syncer state for one outer round in progress."""
     round_id: int
@@ -165,6 +214,15 @@ class _SyncerState:
     failslow_excluded: set[str] = field(default_factory=set)
     round_start_s: float = 0.0
     k_satisfied_at_s: Optional[float] = None
+    # Opt-in incremental-collect running accumulation. None when the mode is
+    # off, before the first accepted fragment, or after a fallback trigger
+    # abandoned incremental accumulation for this round.
+    inc_collect: Optional[_IncrementalCollectState] = None
+    # Why incremental accumulation was abandoned this round (sticky,
+    # diagnostic only): "resubmission", "param_count_mismatch", or
+    # "accumulation_error". None while the accumulation is live or the mode
+    # is off.
+    inc_fallback_reason: Optional[str] = None
     # Expected-learner awareness for this round (Multi-rack 3+/4+ support).
     # None means "expected set unknown" -> the syncer falls back to the
     # quorum-then-full-grace control law (the historical default, preserved
@@ -206,6 +264,25 @@ class GraceWindowSyncer:
     Default (no expected set) behavior is unchanged: quorum, then the full
     grace window, with an empty `learners_absent`.
 
+    Straggler-aware incremental collect (optional, default OFF): pass
+    `incremental_collect=True` and the syncer folds each accepted fragment
+    into a float64 running accumulation at arrival time (i.e. during the
+    grace-window wait) instead of doing all merge arithmetic at finalize.
+    Under a laggard learner only the laggard's own term plus the final
+    divide-and-cast remain on the critical path after the last arrival.
+    The merged tensors are bit-identical to the default path for every
+    arrival pattern by construction: the accumulation replays the exact op
+    sequence (and effective order -- dict insertion order, i.e.
+    first-arrival order) of the frozen `token_weighted_merge` /
+    `uniform_merge` functions, and the syncer falls back to the frozen
+    finalize-time merge for any round where order-identity cannot be proven
+    (a resubmitted fragment, a parameter-count mismatch, an accumulation
+    error, a non-positive token total, or a fragment that was rebound /
+    in-place-mutated after submit -- the frozen path reads fragments at
+    finalize time, so a finalize-time integrity check compares the live
+    store against what was accumulated). The frozen merge functions remain
+    the untouched semantic reference.
+
     The state machine does not block. A real runtime polls
     `tick()` on a clock; the unit tests drive it deterministically by calling
     `set_clock()`.
@@ -219,12 +296,23 @@ class GraceWindowSyncer:
         clock: Callable[[], float] | None = None,
         simulated_merge_delay_ms: int = 0,
         simulated_merge_delay_distribution: str = "constant",
+        incremental_collect: bool = False,
     ) -> None:
         self.quorum_min = quorum_min_learners
         self.grace_window_ms = grace_window_ms
         self.token_weighted = token_weighted
         self._clock: Callable[[], float] = clock or time.monotonic
         self._state: Optional[_SyncerState] = None
+        # Straggler-aware incremental collect (default OFF). See the class
+        # docstring; with False every code path below is the historical
+        # collect-then-merge behavior, unchanged.
+        self.incremental_collect = bool(incremental_collect)
+        # Observability for tests/benchmarks: whether the LAST finalized
+        # round's merged delta came from the incremental accumulation.
+        # None = mode off (or no round finalized yet); True = incremental
+        # accumulation used; False = mode on but the round fell back to the
+        # frozen merge path.
+        self._last_merge_used_incremental: Optional[bool] = None
         # Phase 2 Week 1 Day 4-7: optional injectable delay inside _finalize.
         # Stress-test for the orchestrator's overlap budget against a
         # cross-rack grace-window wait. The FALCON paper (arXiv:2410.12588)
@@ -251,6 +339,15 @@ class GraceWindowSyncer:
         # samples; tests can replace via set_delay_rng().
         import random as _random
         self._delay_rng: _random.Random = _random.Random()
+
+    @property
+    def last_merge_used_incremental(self) -> Optional[bool]:
+        """Whether the LAST finalized round's merged delta came from the
+        incremental accumulation. None = mode off (or no round finalized
+        yet); True = incremental accumulation used; False = mode on but the
+        round fell back to the frozen merge path. Read-only observability
+        for tests and benchmarks."""
+        return self._last_merge_used_incremental
 
     def start_round(
         self,
@@ -350,6 +447,11 @@ class GraceWindowSyncer:
         # Stamp arrival time at the syncer.
         if fragment.arrival_time_s == 0.0:
             fragment.arrival_time_s = self._clock()
+        # Opt-in incremental collect: fold the accepted fragment into the
+        # running accumulation BEFORE the store so a resubmission (key
+        # already present) is detectable. No-op when the mode is off.
+        if self.incremental_collect:
+            self._inc_observe(fragment)
         self._state.fragments[fragment.learner_id] = fragment
         # Quorum satisfaction stamp.
         if (
@@ -358,6 +460,158 @@ class GraceWindowSyncer:
         ):
             self._state.k_satisfied_at_s = self._clock()
         return self.tick()
+
+    def _inc_observe(self, fragment: LearnerFragment) -> None:
+        """Fold an accepted fragment into the round's running incremental
+        accumulation, or abandon incremental accumulation for this round when
+        bit-exact equivalence with the frozen merge can no longer be proven.
+
+        Called only when `incremental_collect` is True, after the fail-slow /
+        stale-round rejections in `submit()` and BEFORE the fragment is
+        stored, so a resubmission is detectable (`learner_id` already
+        present in the fragment store).
+
+        Why this is bit-exact by construction: the frozen merge functions
+        iterate `list(fragments.values())`, i.e. dict insertion order, which
+        is the order in which each learner's fragment FIRST arrived. Folding
+        each new learner's term in at arrival time therefore executes the
+        byte-identical float64 op sequence the frozen path would execute at
+        finalize (`zeros_like` seed, then one `acc + term` per fragment, per
+        parameter; the per-parameter accumulator chains are independent, so
+        fragment-major vs parameter-major nesting cannot reorder any chain).
+        The canonical-order prefix that has fully arrived is always the
+        entire arrived set.
+
+        Fallback triggers (sticky for the round; the frozen path then runs
+        at finalize and reproduces the default behavior exactly, including
+        its error timing and messages):
+
+        - "resubmission": the dict overwrite keeps the learner's ORIGINAL
+          position with the NEW value; float subtraction cannot bit-exactly
+          undo the old term, so the prefix is no longer provably
+          order-identical.
+        - "param_count_mismatch": the frozen path raises ValueError at
+          finalize for this case.
+        - "accumulation_error": anything torch raises mid-accumulation
+          (e.g. incompatible shapes) is the frozen path's error to raise, at
+          finalize, not submit time.
+        """
+        state = self._state
+        assert state is not None
+        if state.inc_fallback_reason is not None:
+            return
+        if fragment.learner_id in state.fragments:
+            state.inc_collect = None
+            state.inc_fallback_reason = "resubmission"
+            return
+        inc = state.inc_collect
+        if inc is not None and len(fragment.params_delta) != inc.n_params:
+            state.inc_collect = None
+            state.inc_fallback_reason = "param_count_mismatch"
+            return
+        try:
+            if inc is None:
+                # First accepted fragment of the round: seed the per-parameter
+                # accumulators exactly the way the frozen functions do
+                # (float64 zeros shaped like frags[0], then add the first
+                # term).
+                acc: list[Tensor] = []
+                for t in fragment.params_delta:
+                    a = torch.zeros_like(t, dtype=torch.float64)
+                    if self.token_weighted:
+                        a = a + fragment.tokens_consumed * t.to(torch.float64)
+                    else:
+                        a = a + t.to(torch.float64)
+                    acc.append(a)
+                inc = _IncrementalCollectState(
+                    acc=acc,
+                    first_dtypes=[t.dtype for t in fragment.params_delta],
+                    n_params=len(fragment.params_delta),
+                    total_tokens=fragment.tokens_consumed,
+                    count=1,
+                )
+                state.inc_collect = inc
+            else:
+                for p_idx in range(inc.n_params):
+                    t = fragment.params_delta[p_idx]
+                    if self.token_weighted:
+                        inc.acc[p_idx] = inc.acc[p_idx] + fragment.tokens_consumed * t.to(
+                            torch.float64
+                        )
+                    else:
+                        inc.acc[p_idx] = inc.acc[p_idx] + t.to(torch.float64)
+                inc.total_tokens += fragment.tokens_consumed
+                inc.count += 1
+            inc.snapshots.append(
+                _FragmentSnapshot(
+                    learner_id=fragment.learner_id,
+                    fragment=fragment,
+                    tokens_consumed=fragment.tokens_consumed,
+                    tensors=tuple(fragment.params_delta),
+                    tensor_versions=tuple(t._version for t in fragment.params_delta),
+                )
+            )
+        except Exception:
+            state.inc_collect = None
+            state.inc_fallback_reason = "accumulation_error"
+
+    def _inc_finalize_merge(self, state: _SyncerState) -> Optional[list[Tensor]]:
+        """Return the round's merged delta from the running incremental
+        accumulation, or None when the frozen path must be used instead.
+
+        None is returned when: the accumulation was abandoned (see
+        `_inc_observe`), no fragment was accepted, the bookkeeping disagrees
+        with the fragment store (defensive; should not happen), the token
+        total is non-positive (the frozen path owns that ValueError), or the
+        finalize-time integrity check fails (see below).
+
+        Integrity check: the frozen merge functions read the fragments AT
+        FINALIZE TIME, while the accumulation baked their values in at
+        arrival. If a caller rebound a fragment / its tensors or mutated a
+        tensor in place after submit (any API-level in-place op bumps the
+        PyTorch version counter), the accumulation is no longer provably
+        bit-identical to what the frozen path would compute now, so the round
+        falls back -- and the frozen path then sees the post-mutation values,
+        exactly like the default mode. Raw-storage pokes that bypass the
+        version counter (e.g. through `.data`) are not detectable this way
+        and are out of scope: fragments are owned by the syncer once
+        submitted. The check is O(fragments x params) pointer/int compares,
+        negligible next to the merge arithmetic it protects.
+
+        The division-and-cast here is the frozen functions' own final step
+        (`(acc / float(divisor)).to(frags[0].params_delta[p].dtype)`), applied
+        to a bit-identical accumulator, so the returned tensors are
+        bit-identical to the frozen result.
+        """
+        inc = state.inc_collect
+        if inc is None:
+            return None
+        if inc.count != len(state.fragments):
+            return None
+        if len(inc.snapshots) != len(state.fragments):
+            return None  # defensive bookkeeping cross-check
+        for snap, (learner_id, frag) in zip(inc.snapshots, state.fragments.items()):
+            if snap.learner_id != learner_id or snap.fragment is not frag:
+                return None
+            if snap.tokens_consumed != frag.tokens_consumed:
+                return None
+            if len(snap.tensors) != len(frag.params_delta):
+                return None
+            for t_snap, v_snap, t_now in zip(
+                snap.tensors, snap.tensor_versions, frag.params_delta
+            ):
+                if t_snap is not t_now or v_snap != t_now._version:
+                    return None
+        if self.token_weighted:
+            if inc.total_tokens <= 0:
+                return None
+            divisor = float(inc.total_tokens)
+        else:
+            divisor = float(inc.count)
+        return [
+            (inc.acc[p_idx] / divisor).to(inc.first_dtypes[p_idx])
+            for p_idx in range(inc.n_params)
+        ]
 
     def _all_expected_present(self) -> bool:
         """True when expected-learner awareness is active, quorum is met, and
@@ -514,7 +768,18 @@ class GraceWindowSyncer:
                 time.sleep(delay_ms / 1000.0)
         merger = token_weighted_merge if self.token_weighted else uniform_merge
         fragments = list(self._state.fragments.values())
-        merged = merger(fragments)
+        # Opt-in incremental collect: use the running accumulation when it is
+        # live and provably order-identical; otherwise (including every round
+        # with the mode off) the frozen merge functions run exactly as they
+        # always have.
+        merged: Optional[list[Tensor]] = None
+        if self.incremental_collect:
+            merged = self._inc_finalize_merge(self._state)
+            self._last_merge_used_incremental = merged is not None
+        else:
+            self._last_merge_used_incremental = None
+        if merged is None:
+            merged = merger(fragments)
         received = set(self._state.fragments.keys())
         # Absentee diagnostic: expected learners neither received nor
         # fail-slow-excluded at finalize. Empty when the expected set is

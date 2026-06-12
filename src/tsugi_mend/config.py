@@ -63,6 +63,24 @@ class MendConfig:
     # by the number of tokens consumed by that learner since the last
     # outer step (Algorithm 2 line 11).
     token_weighted_merge: bool = True
+    # Straggler-aware incremental collect (adapted from straggler-aware
+    # collective scheduling, arXiv:2505.23523, to the fragment/merge
+    # layer). When True, GraceWindowSyncer folds each accepted fragment
+    # into a float64 running accumulation AT ARRIVAL TIME (i.e. during the
+    # grace-window wait) instead of doing all merge arithmetic at finalize,
+    # so under a laggard learner only the laggard's own term plus the final
+    # divide-and-cast remain on the critical path after the last arrival.
+    # Bit-exact by construction: the accumulation replays the exact op
+    # sequence (and effective order -- first-arrival order) of the frozen
+    # token_weighted_merge / uniform_merge functions, and the syncer falls
+    # back to the frozen finalize-time merge for any round where
+    # order-identity cannot be proven (e.g. a resubmitted fragment).
+    # Default False preserves the historical collect-then-merge path
+    # byte-for-byte. NOTE (0.1.x): consumed by GraceWindowSyncer's
+    # constructor when the syncer is built directly; threading this knob
+    # through the runtime / ConcurrentOuterStep wiring is a separate
+    # follow-up change.
+    incremental_collect: bool = False
     # Operator-declared expected learner (rack) roster for each outer
     # round. When set, the runtime threads it to
     # GraceWindowSyncer.start_round(round_id, expected_learner_ids=...),
