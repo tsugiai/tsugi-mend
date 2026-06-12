@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `outer_step_compression_mode="quant4"` with symmetric 4-bit
+  block-wise quantization and per-key error-feedback residuals. The mode is
+  lossy when enabled; the default `"none"` path remains the bit-exact
+  loss-equivalence anchor.
+
 ### Changed
 
 - `MendConfig` construction is now keyword-only. This is a public-API tightening

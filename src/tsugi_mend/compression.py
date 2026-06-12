@@ -7,7 +7,7 @@ transform applied to the params_delta before merge. The synchronous
 reducer path and the orchestrator path both pass through this hook so
 the comparison stays apples-to-apples.
 
-This module ships FOUR compression schemes:
+This module ships FIVE compression schemes:
 
 1. INT8 quantization (lossy, simple): per-tensor symmetric quantization
    followed by dequantization. Fast, framework-independent, no extra
@@ -32,7 +32,18 @@ This module ships FOUR compression schemes:
    deltas fall back to the dense path instead of growing on the wire.
    This is useful only in genuinely sparse-update regimes.
 
-4. None (default; lossless): pass-through. Preserves the bit-exact-
+4. QUANT4 block-wise symmetric quantization with error feedback
+   (lossy, opt-in): each tensor is flattened into 128-element blocks,
+   quantized to signed 4-bit levels [-7, 7], packed two nibbles per
+   byte, then dequantized before merge. One fp32 residual tensor per
+   caller key folds the previous compression error into the next call.
+   Non-finite inputs are sanitized before quantization: NaN becomes
+   0.0, +inf becomes the largest finite value for the input dtype, and
+   -inf becomes the negative of that value. The fp32 working tensor is
+   also clamped to that finite dtype range before quantization. Signed
+   zero may canonicalize to +0.0. This mode is lossy when enabled.
+
+5. None (default; lossless): pass-through. Preserves the bit-exact-
    loss-equivalence anchor.
 
 The PowerSGD implementation here is a single-iteration low-rank
@@ -56,6 +67,7 @@ Usage:
 
     from tsugi_mend.compression import (
         apply_compression, PowerSGDState, powersgd_compress_delta,
+        Quant4State, quant4_compress_delta,
     )
     # Stateless transforms (int8, none):
     out = apply_compression(tensors, mode="int8")
@@ -65,10 +77,11 @@ Usage:
     out0 = powersgd_compress_delta(tensors[0], state=state, key="layer.0.q")
 
 The MendConfig.outer_step_compression_mode knob ("none" | "int8" |
-"powersgd" | "sparse") selects which transform the runtime applies
-inside the default fragment provider. Default "none" preserves bit-exact
-loss equivalence with the vanilla baseline. "sparse" is also lossless,
-but its communication benefit is conditional on element-sparse deltas.
+"powersgd" | "sparse" | "quant4") selects which transform the runtime
+applies inside the default fragment provider. Default "none" preserves
+bit-exact loss equivalence with the vanilla baseline. "sparse" is also
+lossless, but its communication benefit is conditional on element-sparse
+deltas. "quant4" is lossy and experimental.
 """
 from __future__ import annotations
 
@@ -79,9 +92,11 @@ import torch
 from torch import Tensor
 
 
-CompressionMode = Literal["none", "int8", "powersgd", "sparse"]
+CompressionMode = Literal["none", "int8", "powersgd", "sparse", "quant4"]
 SparseDeltaRepresentation = Literal["dense", "sparse"]
 _INT64_INDEX_BYTES = 8
+_QUANT4_BLOCK_SIZE = 128
+_QUANT4_SIGNED_MAX = 7.0
 
 
 @dataclass(frozen=True)
@@ -106,6 +121,24 @@ class SparseDeltaPayload:
     dense: Tensor | None = None
     indices: Tensor | None = None
     values: Tensor | None = None
+
+
+@dataclass(frozen=True)
+class Quant4Payload:
+    """Wire-shape description for a lossy block-wise QUANT4 payload.
+
+    The flattened tensor is split into `block_size` chunks. Each block uses
+    one fp32 symmetric scale and signed quantization levels [-7, 7]. The signed
+    values are offset by +8 and packed two 4-bit nibbles per uint8 byte. Decode
+    reconstructs a dense tensor with the original shape and dtype.
+    """
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    block_size: int
+    scales: Tensor
+    packed: Tensor
+    numel: int
 
 
 @dataclass
@@ -146,6 +179,31 @@ class PowerSGDState:
         for stored in list(self.residuals.keys()):
             if stored.startswith(prefix):
                 del self.residuals[stored]
+
+
+@dataclass
+class Quant4State:
+    """Persistent state for QUANT4 with error feedback.
+
+    `block_size` defaults to 128 elements. The power-of-two block keeps scale
+    overhead low enough for moderate and large deltas, while remaining small
+    enough that one outlier does not set the scale for an entire tensor.
+
+    `residuals` stores exactly one fp32 error-feedback tensor per caller key.
+    The next call with the same key adds that residual before quantization, then
+    overwrites it with the new compression error. `reset()` clears all keys, or
+    one key when supplied.
+    """
+
+    block_size: int = _QUANT4_BLOCK_SIZE
+    residuals: dict[str, Tensor] = field(default_factory=dict)
+
+    def reset(self, key: str | None = None) -> None:
+        """Clear all residuals, or the residual for `key` when supplied."""
+        if key is None:
+            self.residuals.clear()
+            return
+        self.residuals.pop(key, None)
 
 
 def _reshape_2d(tensor: Tensor) -> tuple[Tensor, tuple[int, ...]]:
@@ -269,6 +327,182 @@ def int8_quantize_delta(tensor: Tensor) -> Tensor:
     return dequantized.to(orig_dtype)
 
 
+def _require_quant4_block_size(block_size: int) -> None:
+    if block_size < 1:
+        raise ValueError(f"quant4 block_size must be >= 1; got {block_size}")
+
+
+def _require_floating_tensor(tensor: Tensor) -> None:
+    if not tensor.dtype.is_floating_point:
+        raise TypeError(f"quant4 compression requires a floating-point tensor; got {tensor.dtype}")
+
+
+def _quant4_finite_limit(dtype: torch.dtype) -> float:
+    if not dtype.is_floating_point:
+        raise TypeError(f"quant4 compression requires a floating-point dtype; got {dtype}")
+    return float(torch.finfo(dtype).max)
+
+
+def _quant4_sanitize_to_float32(tensor: Tensor, *, limit_dtype: torch.dtype) -> Tensor:
+    """Convert to fp32 and apply the documented non-finite policy."""
+    limit = _quant4_finite_limit(limit_dtype)
+    sanitized = torch.nan_to_num(
+        tensor.detach().to(torch.float32),
+        nan=0.0,
+        posinf=limit,
+        neginf=-limit,
+    )
+    return sanitized.clamp(min=-limit, max=limit)
+
+
+def _quant4_encode_float32(
+    tensor: Tensor,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    block_size: int,
+) -> Quant4Payload:
+    _require_quant4_block_size(block_size)
+    flat = tensor.detach().contiguous().reshape(-1).to(torch.float32)
+    numel = int(flat.numel())
+    if numel == 0:
+        empty_u8 = torch.empty(0, dtype=torch.uint8, device=flat.device)
+        empty_scale = torch.empty(0, dtype=torch.float32, device=flat.device)
+        return Quant4Payload(
+            shape=shape,
+            dtype=dtype,
+            block_size=block_size,
+            scales=empty_scale,
+            packed=empty_u8,
+            numel=0,
+        )
+
+    num_blocks = (numel + block_size - 1) // block_size
+    padded_numel = num_blocks * block_size
+    if padded_numel == numel:
+        padded = flat
+    else:
+        padded = torch.zeros(padded_numel, dtype=torch.float32, device=flat.device)
+        padded[:numel] = flat
+
+    blocks = padded.reshape(num_blocks, block_size)
+    max_abs = blocks.abs().amax(dim=1)
+    nonzero = max_abs.gt(0)
+    safe_scales = torch.where(
+        nonzero,
+        max_abs / _QUANT4_SIGNED_MAX,
+        torch.ones_like(max_abs),
+    )
+    scales = torch.where(nonzero, safe_scales, torch.zeros_like(max_abs))
+    quantized = torch.round(blocks / safe_scales[:, None]).clamp(-7, 7)
+    quantized = torch.where(nonzero[:, None], quantized, torch.zeros_like(quantized))
+    codes = (quantized.reshape(-1)[:numel].to(torch.int16) + 8).to(torch.uint8)
+
+    if codes.numel() % 2 != 0:
+        # Code 8 decodes to signed zero.
+        codes = torch.cat([codes, torch.full((1,), 8, dtype=torch.uint8, device=codes.device)])
+    low = codes[0::2].to(torch.int16)
+    high = codes[1::2].to(torch.int16)
+    packed = torch.bitwise_or(low, torch.bitwise_left_shift(high, 4)).to(torch.uint8)
+
+    return Quant4Payload(
+        shape=shape,
+        dtype=dtype,
+        block_size=block_size,
+        scales=scales.detach().clone(),
+        packed=packed.detach().clone(),
+        numel=numel,
+    )
+
+
+def quant4_delta_encode(tensor: Tensor, *, block_size: int = _QUANT4_BLOCK_SIZE) -> Quant4Payload:
+    """Encode a floating-point delta tensor as a block-wise QUANT4 payload.
+
+    Each 128-element block by default uses symmetric signed levels [-7, 7],
+    packed two nibbles per byte with one fp32 scale per block. Non-finite
+    values are sanitized before quantization: NaN becomes 0.0, +inf becomes
+    the largest finite value for the input dtype, and -inf becomes the negative
+    of that value. The fp32 working tensor is also clamped to that finite dtype
+    range before quantization. Signed zero may canonicalize to +0.0. Decode
+    returns the dequantized tensor in the original dtype and shape.
+    """
+    _require_floating_tensor(tensor)
+    sanitized = _quant4_sanitize_to_float32(tensor, limit_dtype=tensor.dtype)
+    return _quant4_encode_float32(
+        sanitized,
+        shape=tuple(tensor.shape),
+        dtype=tensor.dtype,
+        block_size=block_size,
+    )
+
+
+def quant4_delta_decode(payload: Quant4Payload) -> Tensor:
+    """Decode a `Quant4Payload` to a dense dequantized tensor."""
+    _require_quant4_block_size(payload.block_size)
+    expected_blocks = 0 if payload.numel == 0 else (payload.numel + payload.block_size - 1) // payload.block_size
+    if payload.scales.numel() != expected_blocks:
+        raise ValueError(
+            f"quant4 payload has {payload.scales.numel()} scales for "
+            f"{payload.numel} values and block_size {payload.block_size}"
+        )
+    expected_packed = (payload.numel + 1) // 2
+    if payload.packed.numel() != expected_packed:
+        raise ValueError(
+            f"quant4 payload has {payload.packed.numel()} packed bytes for "
+            f"{payload.numel} values"
+        )
+    if payload.numel == 0:
+        return torch.empty(payload.shape, dtype=payload.dtype, device=payload.packed.device)
+
+    packed_i16 = payload.packed.to(torch.int16)
+    low = torch.bitwise_and(packed_i16, 0x0F)
+    high = torch.bitwise_and(torch.bitwise_right_shift(packed_i16, 4), 0x0F)
+    codes = torch.empty(payload.packed.numel() * 2, dtype=torch.int16, device=payload.packed.device)
+    codes[0::2] = low
+    codes[1::2] = high
+    signed = codes[: payload.numel].to(torch.float32) - 8.0
+
+    scale_per_value = payload.scales.to(torch.float32).repeat_interleave(payload.block_size)
+    dequantized = signed * scale_per_value[: payload.numel]
+    return dequantized.reshape(payload.shape).to(payload.dtype)
+
+
+def quant4_compress_delta(
+    tensor: Tensor,
+    *,
+    state: Quant4State | None = None,
+    key: str = "tensor",
+) -> Tensor:
+    """Lossy QUANT4 encode/decode transform with optional error feedback.
+
+    When `state` is supplied, the compressor adds `state.residuals[key]` to the
+    next input before quantizing and then stores the new fp32 compression error
+    back at the same key. The state is bounded to one residual tensor per key.
+    Non-finite handling follows `quant4_delta_encode`: NaN -> 0.0, +inf ->
+    dtype max finite, -inf -> dtype min finite, clamp to the finite dtype
+    range, with signed zero allowed to canonicalize to +0.0.
+    """
+    _require_floating_tensor(tensor)
+    block_size = state.block_size if state is not None else _QUANT4_BLOCK_SIZE
+    working = tensor.detach().to(torch.float32)
+    if state is not None:
+        residual = state.residuals.get(key)
+        if residual is not None and residual.shape == tensor.shape:
+            working = working + residual.to(device=working.device, dtype=torch.float32)
+
+    working = _quant4_sanitize_to_float32(working, limit_dtype=tensor.dtype)
+    payload = _quant4_encode_float32(
+        working,
+        shape=tuple(tensor.shape),
+        dtype=tensor.dtype,
+        block_size=block_size,
+    )
+    decoded = quant4_delta_decode(payload)
+    if state is not None:
+        state.residuals[key] = (working - decoded.detach().to(torch.float32)).detach()
+    return decoded
+
+
 def _bitwise_nonzero_mask(tensor: Tensor) -> Tensor:
     """Return a flat mask for elements whose raw byte pattern is not zero.
 
@@ -379,16 +613,18 @@ def apply_compression(
     mode: CompressionMode = "none",
     *,
     powersgd_state: PowerSGDState | None = None,
+    quant4_state: Quant4State | None = None,
     key_prefix: str = "t",
 ) -> list[Tensor]:
     """Apply the named compression scheme to a list of tensors. Returns
     a new list; does not modify the input.
 
-    For PowerSGD, the caller must supply a `powersgd_state` to enable
-    error feedback across calls. Each tensor gets a unique key derived
-    from `key_prefix` + its positional index, so persistent residuals
+    For PowerSGD and QUANT4, callers should supply a persistent state object
+    to enable error feedback across calls. Each tensor gets a unique key
+    derived from `key_prefix` + its positional index, so persistent residuals
     line up across calls (callers should pass a stable key_prefix per
-    layer-identity).
+    layer-identity). If a state is omitted, a fresh temporary state is used for
+    this call only.
     """
     if mode == "none":
         return [t.detach().clone() for t in tensors]
@@ -403,19 +639,32 @@ def apply_compression(
         ]
     if mode == "sparse":
         return [sparse_compress_delta(t) for t in tensors]
+    if mode == "quant4":
+        if quant4_state is None:
+            quant4_state = Quant4State()
+        return [
+            quant4_compress_delta(t, state=quant4_state, key=f"{key_prefix}.{i}")
+            for i, t in enumerate(tensors)
+        ]
     raise ValueError(
-        f"unknown compression mode {mode!r}; expected one of: none, int8, powersgd, sparse"
+        f"unknown compression mode {mode!r}; expected one of: "
+        f"none, int8, powersgd, sparse, quant4"
     )
 
 
 __all__ = [
     "CompressionMode",
     "PowerSGDState",
+    "Quant4Payload",
+    "Quant4State",
     "SparseDeltaPayload",
     "SparseDeltaRepresentation",
     "apply_compression",
     "int8_quantize_delta",
     "powersgd_compress_delta",
+    "quant4_compress_delta",
+    "quant4_delta_decode",
+    "quant4_delta_encode",
     "sparse_compress_delta",
     "sparse_delta_decode",
     "sparse_delta_encode",

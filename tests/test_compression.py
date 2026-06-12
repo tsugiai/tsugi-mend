@@ -4,12 +4,17 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tsugi_mend.config import MendConfig
 from tsugi_mend.compression import (
     PowerSGDState,
+    Quant4State,
     _bitwise_nonzero_mask,
     apply_compression,
     int8_quantize_delta,
     powersgd_compress_delta,
+    quant4_compress_delta,
+    quant4_delta_decode,
+    quant4_delta_encode,
     sparse_delta_decode,
     sparse_delta_encode,
 )
@@ -90,6 +95,16 @@ def test_apply_compression_none_is_identity():
     assert out[0] is not tensors[0]
 
 
+def test_apply_compression_none_stays_bit_exact_with_quant4_available():
+    tensors = [
+        torch.randn(2, 3),
+        torch.tensor([0.0, -0.0, 1.5, -2.25], dtype=torch.float32),
+    ]
+    out = apply_compression(tensors, mode="none", quant4_state=Quant4State())
+    for actual, expected in zip(out, tensors):
+        _assert_same_bits(actual, expected)
+
+
 def test_apply_compression_int8_round_trip():
     tensors = [torch.randn(8) * 0.01 for _ in range(3)]
     out = apply_compression(tensors, mode="int8")
@@ -103,8 +118,90 @@ def test_apply_compression_int8_round_trip():
 
 
 def test_apply_compression_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="unknown compression mode"):
+    with pytest.raises(ValueError, match="unknown compression mode.*quant4"):
         apply_compression([torch.randn(4)], mode="powerful")  # type: ignore[arg-type]
+
+
+# ----------------------------------------------------------------------
+# QUANT4 block-wise codec with error feedback
+# ----------------------------------------------------------------------
+
+
+def test_quant4_round_trip_preserves_shape_dtype_and_error_bound():
+    tensor = torch.linspace(-1.3, 0.7, 257, dtype=torch.float32)
+    payload = quant4_delta_encode(tensor, block_size=64)
+    decoded = quant4_delta_decode(payload)
+
+    assert decoded.shape == tensor.shape
+    assert decoded.dtype == tensor.dtype
+    assert payload.packed.dtype == torch.uint8
+    assert payload.packed.numel() == (tensor.numel() + 1) // 2
+
+    flat_error = (decoded - tensor).abs().reshape(-1)
+    for block_index, scale in enumerate(payload.scales):
+        start = block_index * payload.block_size
+        stop = min(start + payload.block_size, tensor.numel())
+        block_error = flat_error[start:stop].max()
+        assert block_error <= scale + 1e-6
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_quant4_handles_float_edges_and_sanitizes_nonfinite(dtype):
+    tensor = torch.tensor(
+        [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 1.0, -1.0],
+        dtype=dtype,
+    )
+    out = quant4_compress_delta(tensor, state=Quant4State(block_size=4), key="edge")
+
+    assert out.shape == tensor.shape
+    assert out.dtype == tensor.dtype
+    assert torch.isfinite(out.to(torch.float32)).all()
+
+
+def test_quant4_error_feedback_improves_repeated_fixed_delta_average():
+    delta = torch.linspace(-0.83, 0.91, 257, dtype=torch.float32)
+    steps = 16
+
+    stateless_outputs = torch.stack([quant4_compress_delta(delta) for _ in range(steps)])
+    stateless_mean_error = (stateless_outputs.mean(dim=0) - delta).abs().mean()
+
+    state = Quant4State(block_size=64)
+    ef_outputs = torch.stack(
+        [quant4_compress_delta(delta, state=state, key="fixed") for _ in range(steps)]
+    )
+    ef_mean_error = (ef_outputs.mean(dim=0) - delta).abs().mean()
+
+    assert "fixed" in state.residuals
+    assert state.residuals["fixed"].shape == delta.shape
+    assert ef_mean_error < stateless_mean_error
+
+
+def test_quant4_state_reset_clears_one_residual_per_key():
+    state = Quant4State(block_size=32)
+    _ = quant4_compress_delta(torch.randn(65), state=state, key="a")
+    _ = quant4_compress_delta(torch.randn(65), state=state, key="b")
+
+    assert set(state.residuals) == {"a", "b"}
+    state.reset(key="a")
+    assert set(state.residuals) == {"b"}
+    state.reset()
+    assert state.residuals == {}
+
+
+def test_quant4_apply_compression_and_config_validation():
+    MendConfig(outer_step_compression_mode="quant4")
+    with pytest.raises(ValueError, match="outer_step_compression_mode.*quant4"):
+        MendConfig(outer_step_compression_mode="lossy-sparse")
+
+    state = Quant4State(block_size=64)
+    tensors = [torch.randn(129, dtype=torch.float32), torch.randn(17, dtype=torch.float32)]
+    out = apply_compression(tensors, mode="quant4", quant4_state=state, key_prefix="layer")
+
+    assert len(out) == len(tensors)
+    for actual, expected in zip(out, tensors):
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+    assert set(state.residuals) == {"layer.0", "layer.1"}
 
 
 # ----------------------------------------------------------------------

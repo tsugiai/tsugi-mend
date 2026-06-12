@@ -31,7 +31,7 @@
 | `async_tp.enable_async_tp` | PyTorch / TorchTitan async-TP, September 2024 | best-effort enabling of TorchTitan's intra-node async-TP path |
 | `failslow.FailSlowDetector` | FALCON, arXiv:2410.12588 | sliding-window z-score detection of slow ranks |
 | `autotuner.RuntimeAutotuner` | Guard (arXiv:2605.17879) online performance monitoring; "From Detection to Recovery" (arXiv:2605.09370) operational recovery-wait analysis | online (continuous) adaptation of the fail-slow detection threshold and the grace-window wall-clock wait from the observed step-time stream |
-| `compression.apply_compression` | INT8 quantization, PowerSGD (arXiv:1905.13727), SparseRL-Sync (arXiv:2605.07330) | optional outer-step delta transforms; `none` and `sparse` are lossless, while `int8` and `powersgd` are lossy opt-in modes |
+| `compression.apply_compression` | INT8 quantization, PowerSGD (arXiv:1905.13727), SparseRL-Sync (arXiv:2605.07330), block-wise 4-bit quantization with error feedback | optional outer-step delta transforms; `none` and `sparse` are lossless, while `int8`, `powersgd`, and `quant4` are lossy opt-in modes |
 | `topology.detect` | generic engineering | rack classification from NCCL_TOPO_FILE or hostname grouping |
 | `sideband.Sideband` | generic engineering | low-bandwidth TCP heartbeat carrying step-id / vector-clock / queue-depth / health metadata |
 | `diagnostics.DiagnosticsWriter` | generic engineering | append-only JSONL event log |
@@ -76,11 +76,26 @@ The effective values and the steps on which they changed are surfaced as `auto_t
 
 ## Optional compression modes
 
-`MendConfig.outer_step_compression_mode` defaults to `none`, which clones the dense delta and preserves the established bit-exact path. `int8` and `powersgd` remain lossy experimental modes and are off by default.
+`MendConfig.outer_step_compression_mode` defaults to `none`, which clones the dense delta and preserves the established bit-exact path. `int8`, `powersgd`, and `quant4` remain lossy experimental modes and are off by default.
 
 The `sparse` mode is different: it is lossless. Each tensor is encoded as flattened int64 indices plus exact values only when that sparse payload is estimated to be smaller than the dense tensor payload; otherwise it falls back to dense. Decoding reconstructs the original dense tensor bit-for-bit before merge, including negative zero and non-finite values.
 
 This mode only helps when the transmitted delta is genuinely element-sparse, such as adapter-heavy or sparse-update regimes. The default DiLoCo-style `params_delta` after many inner optimizer steps is typically dense, so the sparse codec is expected to choose dense fallback there rather than reduce communication.
+
+The `quant4` mode uses symmetric 4-bit block-wise quantization with 128
+elements per block, packs two signed nibbles per byte, and carries one fp32
+scale per block. A persistent `Quant4State` stores one fp32 residual tensor per
+caller key so the next outer step can add the previous compression error before
+quantizing. Non-finite values are sanitized before quantization: NaN becomes
+0.0, +inf becomes the largest finite value for the input dtype, and -inf
+becomes the negative of that value. The fp32 working tensor is also clamped to
+that finite dtype range. Signed zero may canonicalize to +0.0.
+
+`quant4` is lossy whenever enabled. The implementation makes no bandwidth or
+model-quality claim for tsugi-mend; any such claim must be read as belonging to
+the external paper or benchmark that reports it, not to this repository. The
+default `none` mode is unchanged and remains the bit-exact loss-equivalence
+anchor.
 
 ## File-by-file reading order
 
