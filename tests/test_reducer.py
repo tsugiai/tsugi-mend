@@ -1,6 +1,8 @@
 """Decoupled DiLoCo reducer tests: quorum, grace window, token-weighted merge."""
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
 
@@ -403,6 +405,123 @@ def test_multirack_all_present_early_finalizes(n: int):
     # Merged delta = uniform-token average of 0..n-1.
     expected_mean = sum(range(n)) / n
     assert torch.allclose(out.merged_delta[0], torch.tensor([expected_mean]))
+
+
+def test_multirack_correct_roster_does_not_trigger_fallback():
+    clock = FakeClock()
+    ids = ["rack-0", "rack-1", "rack-2"]
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=1_000_000,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=10, expected_learner_ids=set(ids))
+    assert sync.submit(_mk_fragment("rack-0", 10, [1.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("rack-1", 10, [2.0], tokens=100)) is None
+    out = sync.submit(_mk_fragment("rack-2", 10, [3.0], tokens=100))
+
+    assert out is not None
+    assert out.reason == "all_present"
+    assert out.roster_fallback is False
+    assert sorted(out.learners_merged) == ids
+
+
+def test_multirack_underdeclared_roster_fallback_matches_none_path(caplog):
+    """Unexpected learners disable roster awareness in place without changing
+    the quorum stamp, elapsed grace, or merged tensor bits."""
+
+    def run(expected_ids: set[str] | None):
+        clock = FakeClock()
+        sync = GraceWindowSyncer(
+            quorum_min_learners=2,
+            grace_window_ms=500,
+            token_weighted=True,
+            clock=clock,
+        )
+        sync.start_round(round_id=11, expected_learner_ids=expected_ids)
+        assert sync.submit(_mk_fragment("rack-0", 11, [1.0, -1.0], tokens=100)) is None
+        clock.advance_ms(100)
+        assert sync.submit(_mk_fragment("rack-2", 11, [5.0, -5.0], tokens=300)) is None
+        clock.advance_ms(100)
+        assert sync.submit(_mk_fragment("rack-1", 11, [3.0, -3.0], tokens=200)) is None
+        clock.advance_ms(450)
+        out = sync.tick()
+        assert out is not None
+        return out
+
+    caplog.set_level(logging.WARNING, logger="tsugi_mend.reducer")
+    fallback = run({"rack-0", "rack-1"})
+    baseline = run(None)
+
+    assert fallback.roster_fallback is True
+    assert baseline.roster_fallback is False
+    assert fallback.reason == baseline.reason == "grace_expired"
+    assert fallback.elapsed_grace_ms == baseline.elapsed_grace_ms
+    assert fallback.learners_merged == baseline.learners_merged
+    assert fallback.learners_absent == []
+    for fallback_tensor, baseline_tensor in zip(
+        fallback.merged_delta, baseline.merged_delta
+    ):
+        assert torch.equal(fallback_tensor, baseline_tensor)
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "tsugi_mend.reducer"
+        and "arrived outside the declared expected_learner_ids roster"
+        in record.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+def test_multirack_underdeclared_roster_rescues_further_late_learner():
+    clock = FakeClock()
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=12, expected_learner_ids={"rack-0", "rack-1"})
+    assert sync.submit(_mk_fragment("rack-0", 12, [1.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("rack-2", 12, [5.0], tokens=100)) is None
+    clock.advance_ms(100)
+    assert sync.submit(_mk_fragment("rack-1", 12, [3.0], tokens=100)) is None
+    clock.advance_ms(100)
+    assert sync.submit(_mk_fragment("rack-3", 12, [7.0], tokens=100)) is None
+    clock.advance_ms(400)
+    out = sync.tick()
+
+    assert out is not None
+    assert out.roster_fallback is True
+    assert out.reason == "grace_expired"
+    assert sorted(out.learners_merged) == ["rack-0", "rack-1", "rack-2", "rack-3"]
+    assert torch.equal(out.merged_delta[0], torch.tensor([4.0]))
+
+
+def test_multirack_underdeclared_roster_preserves_failslow_exclusion():
+    clock = FakeClock()
+    sync = GraceWindowSyncer(
+        quorum_min_learners=2,
+        grace_window_ms=500,
+        token_weighted=True,
+        clock=clock,
+    )
+    sync.start_round(round_id=13, expected_learner_ids={"rack-0", "rack-1"})
+    sync.mark_failslow("rack-3")
+    assert sync.submit(_mk_fragment("rack-0", 13, [1.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("rack-2", 13, [5.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("rack-3", 13, [99.0], tokens=100)) is None
+    assert sync.submit(_mk_fragment("rack-1", 13, [3.0], tokens=100)) is None
+    clock.advance_ms(600)
+    out = sync.tick()
+
+    assert out is not None
+    assert out.roster_fallback is True
+    assert sorted(out.learners_merged) == ["rack-0", "rack-1", "rack-2"]
+    assert out.learners_excluded == ["rack-3"]
+    assert "rack-3" not in out.learners_merged
 
 
 @pytest.mark.parametrize("n", _RACK_COUNTS)

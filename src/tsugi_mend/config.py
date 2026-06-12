@@ -74,11 +74,13 @@ class MendConfig:
     # the arriving fragments' learner_id by the syncer. Ids that never
     # arrive are safe: early-finalize never fires, the round falls back to
     # quorum-then-grace, and the absentees are reported. A quorum the
-    # roster cannot satisfy is rejected at config init. An UNDER-DECLARED
-    # roster (one that omits a live learner) is NOT detected: the round
-    # early-finalizes once the declared set is present, which can exclude
-    # a late straggler that a roster-unaware round would have merged
-    # within the remaining grace window. Declare the full roster.
+    # roster cannot satisfy is rejected at config init. If an under-declared
+    # roster omits a live learner and that learner arrives during the round,
+    # the syncer disables roster-aware early-finalize in place for that round,
+    # preserves already-accepted fragments, and continues under the historical
+    # quorum-then-grace path. The `outer_step_collect` diagnostic event reports
+    # this as `roster_fallback=true`. Declare the full roster to avoid the
+    # fallback path.
     expected_learner_ids: Optional[tuple[str, ...]] = None
     # Outer-optimizer momentum (Nesterov). DiLoCo / Decoupled DiLoCo
     # default.

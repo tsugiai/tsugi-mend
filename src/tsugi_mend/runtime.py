@@ -474,6 +474,7 @@ class _MaxRuntime:
                 learners_absent=result.learners_absent,
                 elapsed_grace_ms=result.elapsed_grace_ms,
                 reason=result.reason,
+                roster_fallback=result.roster_fallback,
             )
         return result
 
