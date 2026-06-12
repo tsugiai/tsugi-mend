@@ -66,7 +66,10 @@ class MergeResult:
         round_id: the outer-round counter this merge belongs to.
         merged_delta: the token-weighted (or uniform) merged parameter delta.
         learners_merged: sorted ids of the learners whose fragments merged.
-        learners_excluded: sorted ids of learners fail-slow-excluded this round.
+        learners_excluded: sorted ids of learners whose fragments were
+            actually excluded from the merge by a fail-slow mark. If a learner
+            is marked after its fragment was already accepted, the fragment
+            remains merged and the learner is not listed here.
         elapsed_grace_ms: wall-clock ms elapsed in the grace window since the
             quorum-satisfaction stamp (0.0 when quorum was forced or the round
             finalized before the stamp).
@@ -490,6 +493,7 @@ class GraceWindowSyncer:
         merger = token_weighted_merge if self.token_weighted else uniform_merge
         fragments = list(self._state.fragments.values())
         merged = merger(fragments)
+        received = set(self._state.fragments.keys())
         # Absentee diagnostic: expected learners neither received nor
         # fail-slow-excluded at finalize. Empty when the expected set is
         # unknown (the historical default) -- a `learners_absent` of [] then
@@ -498,15 +502,14 @@ class GraceWindowSyncer:
         if expected is None:
             learners_absent: list[str] = []
         else:
-            received = set(self._state.fragments.keys())
             learners_absent = sorted(
                 expected - received - self._state.failslow_excluded
             )
         result = MergeResult(
             round_id=self._state.round_id,
             merged_delta=merged,
-            learners_merged=sorted(self._state.fragments.keys()),
-            learners_excluded=sorted(self._state.failslow_excluded),
+            learners_merged=sorted(received),
+            learners_excluded=sorted(self._state.failslow_excluded - received),
             elapsed_grace_ms=elapsed_grace_ms,
             reason=reason,
             learners_absent=learners_absent,
