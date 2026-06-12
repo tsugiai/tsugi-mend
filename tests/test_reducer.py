@@ -589,6 +589,52 @@ def test_multirack_regression_expected_none_identical_merge_and_reason():
     assert torch.allclose(out2.merged_delta[0], legacy_delta)
 
 
+@pytest.mark.parametrize("token_weighted", [True, False])
+def test_multirack_roster_vs_none_grace_expiry_bit_identical(token_weighted: bool):
+    """Roster awareness must not perturb merged bits when it falls through to
+    the same grace-expiry reason as the historical roster-None path.
+
+    The uniform-merge case is the ENG-16 coverage gap; the token-weighted
+    parameter keeps the proof symmetric with the existing reducer behavior.
+    """
+    fragments = [
+        _mk_fragment("rack-0", 9, [1.5, -2.25, 0.125], tokens=137),
+        _mk_fragment("rack-1", 9, [4.0, 8.0, -16.0], tokens=251),
+        _mk_fragment("rack-2", 9, [-0.5, 3.0, 7.75], tokens=89),
+    ]
+
+    def run(expected_learner_ids: set[str] | None):
+        clock = FakeClock()
+        sync = GraceWindowSyncer(
+            quorum_min_learners=3,
+            grace_window_ms=500,
+            token_weighted=token_weighted,
+            clock=clock,
+        )
+        sync.start_round(round_id=9, expected_learner_ids=expected_learner_ids)
+        for fragment in fragments:
+            assert sync.submit(fragment) is None
+        clock.advance_ms(600)
+        out = sync.tick()
+        assert out is not None
+        return out
+
+    roster_result = run({"rack-0", "rack-1", "rack-2", "ghost"})
+    none_result = run(None)
+
+    assert roster_result.reason == none_result.reason == "grace_expired"
+    assert roster_result.learners_merged == none_result.learners_merged
+    assert roster_result.learners_absent == ["ghost"]
+    assert none_result.learners_absent == []
+    assert len(roster_result.merged_delta) == len(none_result.merged_delta)
+    for roster_tensor, none_tensor in zip(
+        roster_result.merged_delta, none_result.merged_delta
+    ):
+        assert roster_tensor.dtype == none_tensor.dtype
+        assert roster_tensor.shape == none_tensor.shape
+        assert torch.equal(roster_tensor, none_tensor)
+
+
 def test_multirack_regression_default_round_unchanged_token_weighted():
     """(e) A token-weighted legacy round (expected=None) still produces the
     exact token-weighted result, untouched by the new feature path."""

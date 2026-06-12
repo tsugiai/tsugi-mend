@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 
 import pytest
@@ -780,6 +781,77 @@ def test_eng5_misdeclared_roster_falls_back_safely(tmp_path):
         assert torch.allclose(result.merged_delta[0], torch.tensor([2.0]))
     finally:
         mend_shutdown(model)
+
+
+def test_eng5_per_round_undersized_roster_warns_once_and_matches_none(
+    caplog, tmp_path
+):
+    """A per-round roster override smaller than quorum is ignored exactly
+    once and falls back to the historical roster-None semantics."""
+
+    def make_frags(round_id):
+        return [
+            _build_fragment("rack-0", round_id=round_id, value=1.0),
+            _build_fragment("rack-1", round_id=round_id, value=3.0),
+            _build_fragment("rack-2", round_id=round_id, value=5.0),
+        ]
+
+    base_kwargs = dict(
+        quorum_min_learners=3,
+        grace_window_ms=30,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        sideband_peers=(),
+    )
+    baseline = _run_one_round_collect(
+        MendConfig(diagnostics_dir=str(tmp_path / "diag_none"), **base_kwargs),
+        round_id=51,
+        frags=make_frags(51),
+        tmp_path=tmp_path,
+    )
+
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger="tsugi_mend.concurrent")
+
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        diagnostics_dir=str(tmp_path / "diag_undersized"),
+        **base_kwargs,
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        provider = _multi_learner_provider_factory(make_frags(52))
+        rt.outer_step_begin(
+            round_id=52,
+            fragment_provider=provider,
+            expected_learner_ids=frozenset({"rack-0", "rack-1"}),
+        )
+        result = _collect_with_deadline(rt, timeout_s=3.0)
+    finally:
+        mend_shutdown(model)
+
+    assert result is not None, "undersized roster fallback caused a hang"
+    assert result.reason == baseline.reason == "grace_expired"
+    assert result.learners_absent == []
+    assert result.learners_merged == baseline.learners_merged
+    assert len(result.merged_delta) == len(baseline.merged_delta)
+    for fallback_tensor, baseline_tensor in zip(
+        result.merged_delta, baseline.merged_delta
+    ):
+        assert fallback_tensor.dtype == baseline_tensor.dtype
+        assert fallback_tensor.shape == baseline_tensor.shape
+        assert torch.equal(fallback_tensor, baseline_tensor)
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "tsugi_mend.concurrent"
+        and "declared roster of 2 learner(s) is smaller than quorum_min=3"
+        in record.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 def test_eng5_config_expected_learner_ids_validation():
