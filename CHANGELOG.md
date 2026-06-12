@@ -12,6 +12,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `MendConfig` construction is now keyword-only. This is a public-API tightening
   for hypothetical external positional callers; positional field order was never
   a stable contract, so no deprecation shim is warranted.
+- Optimized the lossless sparse-delta bitwise nonzero mask while preserving
+  exact raw-byte semantics for negative zero, non-finite values, and subnormals.
 
 ## [0.1.4] - 2026-06-10
 

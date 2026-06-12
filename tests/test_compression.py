@@ -6,6 +6,7 @@ import torch
 
 from tsugi_mend.compression import (
     PowerSGDState,
+    _bitwise_nonzero_mask,
     apply_compression,
     int8_quantize_delta,
     powersgd_compress_delta,
@@ -20,6 +21,27 @@ def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor) -> None:
     actual_bytes = actual.detach().contiguous().view(torch.uint8)
     expected_bytes = expected.detach().contiguous().view(torch.uint8)
     assert torch.equal(actual_bytes, expected_bytes)
+
+
+def _reference_bitwise_nonzero_mask(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.numel() == 0:
+        return torch.empty(0, dtype=torch.bool, device=tensor.device)
+    element_size = tensor.element_size()
+    byte_view = tensor.detach().contiguous().view(torch.uint8)
+    per_element = byte_view.reshape(tensor.numel(), element_size)
+    return per_element.ne(0).any(dim=1)
+
+
+def _floating_edge_tensor(dtype: torch.dtype) -> torch.Tensor:
+    finite_edges = torch.tensor(
+        [0.0, -0.0, float("inf"), float("-inf"), float("nan")],
+        dtype=dtype,
+    )
+    denormal = torch.nextafter(
+        torch.tensor([0.0], dtype=dtype),
+        torch.tensor([1.0], dtype=dtype),
+    )
+    return torch.cat([finite_edges, denormal])
 
 
 def test_int8_quantize_preserves_shape_and_dtype():
@@ -112,6 +134,43 @@ def test_sparse_delta_round_trips_exact_cases():
         payload = sparse_delta_encode(tensor)
         decoded = sparse_delta_decode(payload)
         _assert_same_bits(decoded, tensor)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_bitwise_nonzero_mask_matches_byte_reference_float_edges(dtype):
+    tensor = _floating_edge_tensor(dtype)
+    mask = _bitwise_nonzero_mask(tensor)
+    assert torch.equal(mask, _reference_bitwise_nonzero_mask(tensor))
+    assert mask.tolist() == [False, True, True, True, True, True]
+
+    decoded = sparse_delta_decode(sparse_delta_encode(tensor))
+    _assert_same_bits(decoded, tensor)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+        torch.int32,
+        torch.int64,
+    ],
+)
+def test_bitwise_nonzero_mask_matches_byte_reference_large_random(dtype):
+    torch.manual_seed(13)
+    if dtype.is_floating_point:
+        tensor = torch.randn(1_000_003, dtype=torch.float32).to(dtype)
+        tensor[::97] = 0.0
+        tensor[1::997] = -0.0
+    else:
+        tensor = torch.randint(-1000, 1000, (1_000_003,), dtype=dtype)
+        tensor[::97] = 0
+
+    assert torch.equal(
+        _bitwise_nonzero_mask(tensor),
+        _reference_bitwise_nonzero_mask(tensor),
+    )
 
 
 def test_sparse_delta_reports_dense_fallback_and_sparse_savings():
