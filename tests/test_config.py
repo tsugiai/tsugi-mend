@@ -11,6 +11,7 @@ def test_defaults_construct():
     assert c.quorum_min_learners == 4
     assert c.grace_window_ms == 2000
     assert c.token_weighted_merge is True
+    assert c.outer_step_incremental_collect is False
     assert c.sync_period_steps == 128
     assert c.momentum_sync_period_steps == 512
     assert c.async_tp_enabled is True
@@ -64,6 +65,10 @@ def test_outer_step_compression_mode_accepts_sparse():
         MendConfig(outer_step_compression_mode=mode)
     with pytest.raises(ValueError, match="outer_step_compression_mode"):
         MendConfig(outer_step_compression_mode="lossy-sparse")
+
+
+def test_outer_step_incremental_collect_opt_in_constructs():
+    assert MendConfig(outer_step_incremental_collect=True).outer_step_incremental_collect is True
 
 
 def test_failslow_validation():

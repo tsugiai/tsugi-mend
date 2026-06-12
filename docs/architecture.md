@@ -74,6 +74,12 @@ The effective values and the steps on which they changed are surfaced as `auto_t
 
 **Why this preserves bit-exact loss equivalence (both OFF and ON).** The detection threshold is observe-only: the detector's decision is a diagnostic flag, no mitigation/exclusion is wired off it here, so adapting the threshold changes only which steps are flagged, never any tensor value. The grace window is a wall-clock wait only: in default (lossless) mode the syncer waits for the same fragments regardless of the wait length, and the merged delta is the token-weighted merge of the same fragment set applied at the same logical boundary, so adapting the wait changes timing/overlap, never which fragments merge or the apply boundary. The autotuner deliberately does **not** online-adapt the merge cadence (`sync_period_steps` / momentum cadence / apply lag): a paired baseline-vs-sdk run has different step times on the two paths (the SDK overlaps the merge), so adapting cadence from measured step times would make the two paths choose different cadences and break bit-exactness. (Rank exclusion / fail-slow mitigation and outer-momentum restarting are separate, deferred concerns and are not part of this autotuner.)
 
+## Incremental outer-step collection (opt-in, default OFF)
+
+`MendConfig.outer_step_incremental_collect` lets `GraceWindowSyncer` accumulate accepted fragments during the grace-window wait instead of doing all arithmetic at finalize time. The default is `False`, which keeps the historical finalize-time merge path.
+
+When enabled, the syncer accumulates in the same effective order the frozen merge functions use today: first accepted fragment order. This is important because floating-point addition is order-sensitive. If a round contains a duplicate learner submission or an incompatible parameter list, the syncer falls back to the frozen finalize-time merge for that round. The merge functions remain the semantic reference, and the tests assert `torch.equal` identity between the opt-in incremental path and the default path across arrival orders, learner counts, merge variants, and fp32/bf16 payloads.
+
 ## Optional compression modes
 
 `MendConfig.outer_step_compression_mode` defaults to `none`, which clones the dense delta and preserves the established bit-exact path. `int8` and `powersgd` remain lossy experimental modes and are off by default.

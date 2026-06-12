@@ -14,6 +14,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   a stable contract, so no deprecation shim is warranted.
 - Optimized the lossless sparse-delta bitwise nonzero mask while preserving
   exact raw-byte semantics for negative zero, non-finite values, and subnormals.
+- Added opt-in first-arrival-order incremental outer-step collection with
+  fallback to the frozen finalize-time merge when exact order identity cannot
+  be proven. Default behavior is unchanged.
 
 ## [0.1.4] - 2026-06-10
 

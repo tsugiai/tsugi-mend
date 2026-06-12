@@ -159,6 +159,11 @@ class _SyncerState:
     # soon as every expected, non-fail-slow learner has reported AND quorum is
     # met, and it can report which expected learners were absent at finalize.
     expected_learner_ids: Optional[set[str]] = None
+    incremental_accumulators: Optional[list[Tensor]] = None
+    incremental_shapes: list[tuple[int, ...]] = field(default_factory=list)
+    incremental_total_tokens: int = 0
+    incremental_count: int = 0
+    incremental_disabled: bool = False
 
 
 class GraceWindowSyncer:
@@ -205,10 +210,12 @@ class GraceWindowSyncer:
         clock: Callable[[], float] | None = None,
         simulated_merge_delay_ms: int = 0,
         simulated_merge_delay_distribution: str = "constant",
+        incremental_collect: bool = False,
     ) -> None:
         self.quorum_min = quorum_min_learners
         self.grace_window_ms = grace_window_ms
         self.token_weighted = token_weighted
+        self.incremental_collect = incremental_collect
         self._clock: Callable[[], float] = clock or time.monotonic
         self._state: Optional[_SyncerState] = None
         # Phase 2 Week 1 Day 4-7: optional injectable delay inside _finalize.
@@ -322,10 +329,13 @@ class GraceWindowSyncer:
             return None
         if fragment.round_id != self._state.round_id:
             return None  # stale or future round; ignore
+        if self.incremental_collect and fragment.learner_id in self._state.fragments:
+            self._state.incremental_disabled = True
         # Stamp arrival time at the syncer.
         if fragment.arrival_time_s == 0.0:
             fragment.arrival_time_s = self._clock()
         self._state.fragments[fragment.learner_id] = fragment
+        self._observe_incremental_fragment(fragment)
         # Quorum satisfaction stamp.
         if (
             len(self._state.fragments) >= self.quorum_min
@@ -333,6 +343,47 @@ class GraceWindowSyncer:
         ):
             self._state.k_satisfied_at_s = self._clock()
         return self.tick()
+
+    def _observe_incremental_fragment(self, fragment: LearnerFragment) -> None:
+        """Accumulate an opt-in first-arrival-order prefix during collection.
+
+        The frozen merge functions use the dict insertion order of accepted
+        fragments. Accumulating in submit order is therefore order-identical
+        for ordinary one-fragment-per-learner rounds. If a duplicate learner
+        or incompatible parameter list appears, the round falls back to the
+        frozen finalize-time merge.
+        """
+        if not self.incremental_collect:
+            return
+        assert self._state is not None
+        state = self._state
+        if state.incremental_disabled:
+            return
+        if state.incremental_accumulators is None:
+            state.incremental_accumulators = [
+                torch.zeros_like(t, dtype=torch.float64)
+                for t in fragment.params_delta
+            ]
+            state.incremental_shapes = [tuple(t.shape) for t in fragment.params_delta]
+        if (
+            state.incremental_accumulators is None
+            or len(fragment.params_delta) != len(state.incremental_accumulators)
+        ):
+            state.incremental_disabled = True
+            return
+        for p_idx, tensor in enumerate(fragment.params_delta):
+            if tuple(tensor.shape) != state.incremental_shapes[p_idx]:
+                state.incremental_disabled = True
+                return
+        for p_idx, tensor in enumerate(fragment.params_delta):
+            term = tensor.to(torch.float64)
+            if self.token_weighted:
+                term = fragment.tokens_consumed * term
+            state.incremental_accumulators[p_idx] = (
+                state.incremental_accumulators[p_idx] + term
+            )
+        state.incremental_total_tokens += fragment.tokens_consumed
+        state.incremental_count += 1
 
     def _all_expected_present(self) -> bool:
         """True when expected-learner awareness is active, quorum is met, and
@@ -487,9 +538,11 @@ class GraceWindowSyncer:
             delay_ms = self._sample_delay_ms()
             if delay_ms > 0:
                 time.sleep(delay_ms / 1000.0)
-        merger = token_weighted_merge if self.token_weighted else uniform_merge
         fragments = list(self._state.fragments.values())
-        merged = merger(fragments)
+        merged = self._incremental_merge(fragments)
+        if merged is None:
+            merger = token_weighted_merge if self.token_weighted else uniform_merge
+            merged = merger(fragments)
         # Absentee diagnostic: expected learners neither received nor
         # fail-slow-excluded at finalize. Empty when the expected set is
         # unknown (the historical default) -- a `learners_absent` of [] then
@@ -513,3 +566,31 @@ class GraceWindowSyncer:
         )
         self._state = None
         return result
+
+    def _incremental_merge(self, fragments: list[LearnerFragment]) -> list[Tensor] | None:
+        if not self.incremental_collect:
+            return None
+        assert self._state is not None
+        state = self._state
+        accs = state.incremental_accumulators
+        if (
+            state.incremental_disabled
+            or accs is None
+            or state.incremental_count != len(fragments)
+            or not fragments
+        ):
+            return None
+        first = fragments[0]
+        if self.token_weighted:
+            if state.incremental_total_tokens <= 0:
+                return None
+            return [
+                (acc / float(state.incremental_total_tokens)).to(
+                    first.params_delta[p_idx].dtype
+                )
+                for p_idx, acc in enumerate(accs)
+            ]
+        return [
+            (acc / float(state.incremental_count)).to(first.params_delta[p_idx].dtype)
+            for p_idx, acc in enumerate(accs)
+        ]

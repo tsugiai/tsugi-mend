@@ -56,6 +56,12 @@ class MendConfig:
     # by the number of tokens consumed by that learner since the last
     # outer step (Algorithm 2 line 11).
     token_weighted_merge: bool = True
+    # Opt-in first-arrival-order incremental collection. When enabled, the
+    # syncer accumulates accepted fragments during the grace wait in the same
+    # order the frozen finalize-time merge functions use, and falls back to
+    # the frozen path if exact order identity cannot be proven for the round.
+    # Default False preserves the historical finalize-time merge path.
+    outer_step_incremental_collect: bool = False
     # Operator-declared expected learner (rack) roster for each outer
     # round. When set, the runtime threads it to
     # GraceWindowSyncer.start_round(round_id, expected_learner_ids=...),

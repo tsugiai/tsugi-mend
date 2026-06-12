@@ -67,6 +67,7 @@ class _MaxRuntime:
             token_weighted=config.token_weighted_merge,
             simulated_merge_delay_ms=config.simulated_merge_delay_ms,
             simulated_merge_delay_distribution=config.simulated_merge_delay_distribution,
+            incremental_collect=config.outer_step_incremental_collect,
         )
         self.sideband: Optional[Sideband] = None
         if config.sideband_peers:
