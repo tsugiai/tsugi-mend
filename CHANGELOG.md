@@ -81,6 +81,28 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   silent fallback) produced each proof cell. Default-OFF code path is
   byte-for-byte the previous behavior.
 
+- New opt-in outer-step compression mode `outer_step_compression_mode="quant4"`
+  at the existing `compression.apply_compression` transform seam: symmetric
+  4-bit block-wise quantization of the outer delta (blocks of 128 elements,
+  one fp32 scale per block computed as max-abs / 7, integer codes in [-7, 7],
+  two codes packed per byte) with a per-key error-feedback residual
+  (`Quant4State`, mirroring how `PowerSGDState` carries its state; exactly one
+  residual tensor per key; cleared by `reset()`). New public symbols:
+  `Quant4State`, `Quant4Payload`, `quant4_encode`, `quant4_decode`,
+  `quant4_compress_delta`, `DEFAULT_QUANT4_BLOCK_SIZE`.
+  **quant4 is LOSSY when enabled.** The default mode remains `none`, which is
+  bit-exact and is byte-for-byte untouched by this change (asserted with
+  `torch.equal` in the new off-path test); `int8` / `powersgd` / `sparse`
+  behavior is unchanged. Pinned non-finite policy: NaN and +/-inf inputs
+  encode as 0 and are excluded from the block scale, and they are sanitized
+  before the error-feedback update so a transient non-finite value cannot
+  poison the persistent residual; IEEE-754 negative zero decodes as +0.0.
+  Motivated by Streaming DiLoCo (arXiv:2501.18512), which reports that 4-bit
+  quantization of outer gradients holds loss at iso-quality while reducing
+  cross-rack bandwidth; that is the paper's claim on the paper's workloads,
+  not a result re-validated here. No new runtime callers are wired; like the
+  other modes, quant4 is exercised at the transform seam only.
+
 ### Changed
 
 - `MendConfig` construction is now keyword-only. This is a public-API tightening
@@ -104,7 +126,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Added deterministic Hypothesis coverage for `GraceWindowSyncer` roster
   bit-identity, liveness, and diagnostic subset invariants.
-
 ## [0.1.4] - 2026-06-10
 
 ### Added
