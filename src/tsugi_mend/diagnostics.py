@@ -16,6 +16,11 @@ Standard event names emitted by the runtime:
     "outer_round"        a Decoupled DiLoCo outer round completed
     "failslow_decision"  per-rank fail-slow decision after a step
     "sideband_snapshot"  periodic peer-progress snapshot
+    "auto_tune_drift_flag"  observe-only per-learner EWMA/CUSUM drift flag
+                         crossed its threshold (emitted on the rising edge
+                         only, by autotuner.RuntimeAutotuner when a writer
+                         is attached). FLAG ONLY: nothing reads it back;
+                         it never feeds exclusion, cadence, or tensors.
 """
 from __future__ import annotations
 

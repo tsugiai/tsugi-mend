@@ -7,6 +7,47 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **RuntimeAutotuner v2 observe-only signals** (default behavior unchanged;
+  autotuner OFF path untouched, ON path with default knobs byte-identical):
+  - **Per-learner EWMA/CUSUM drift flag.** New
+    `autotuner.EwmaCusumDriftClassifier`: an exponentially weighted moving
+    average of each learner's step latency plus a one-sided CUSUM
+    accumulator against the peer baseline (median of the other learners'
+    EWMAs when peer streams are fed via the new
+    `RuntimeAutotuner.observe_peer()`; the learner's own slow-EWMA
+    reference for a single local stream). The design pattern is classical
+    statistical process control (EWMA and one-sided CUSUM control charts);
+    O(1) state and time per observation. It catches a slow intra-window
+    latency drift that a static sliding-window z-score misses (the window
+    mean ramps along with the samples). Surfaced additively as
+    `AutotuneDecision.drift_flag` / `drift_cusum` and, when a diagnostics
+    writer is attached to the autotuner, as a new `auto_tune_drift_flag`
+    JSONL event emitted on the flag's rising edge. **FLAG-ONLY by
+    construction:** the signal never feeds learner exclusion, merge
+    cadence, the effective threshold/grace values, or any tensor; merge
+    math is frozen and default-mode bit-exactness is unaffected.
+  - **Sustained peer-relative gate** on the existing adaptation moves: a
+    sensitivity (z-score threshold) or grace-window move now applies only
+    after its triggering condition has held for
+    `(sustain_windows - 1) * window_steps + 1` consecutive evaluations,
+    i.e. `sustain_windows` consecutive windows' worth (the detection-side
+    multi-window sustained-deviation pattern from Guard, arXiv:2605.17879;
+    its mitigation half, job restart, is deliberately not adopted). The
+    default `sustain_windows = 1` reproduces the previous control law
+    byte-for-byte; any `K >= 2` provably suppresses single-sample blips (a
+    lone sample deviates the rolling-window statistics for at most its
+    window residence). Relaxation back toward baseline is never delayed.
+  - New defaulted `MendConfig` knobs, validated at config init:
+    `auto_tune_sustain_windows`, `auto_tune_drift_ewma_alpha`,
+    `auto_tune_drift_baseline_alpha`, `auto_tune_drift_cusum_slack`,
+    `auto_tune_drift_cusum_threshold`. Note: the runtime does not yet
+    thread these knobs into the `RuntimeAutotuner` it constructs
+    internally (defaults apply on that path, preserving current behavior);
+    the one-line runtime wiring plus peer-stream feeding from the sideband
+    is tracked as follow-up work.
+
 ### Changed
 
 - `MendConfig` construction is now keyword-only. This is a public-API tightening
