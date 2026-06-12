@@ -124,6 +124,79 @@ def test_grace_window_narrows_back_when_clean():
     assert d.effective_grace_window_ms == 1000
 
 
+def test_drift_detector_flags_slow_ramp_against_peer_baseline():
+    at = _make_autotuner(
+        drift_ewma_alpha=0.5,
+        drift_cusum_threshold=0.6,
+        drift_cusum_slack=0.0,
+    )
+    flagged = []
+    for step_time in [100.0, 104.0, 108.0, 112.0, 116.0, 120.0, 124.0]:
+        d = at.observe(
+            step_time,
+            learner_id="rank-slow",
+            peer_baseline_ms=100.0,
+        )
+        flagged.append(d.drift_flag)
+    assert any(flagged)
+    assert d.drift_learner_id == "rank-slow"
+    assert d.drift_cusum >= 0.6
+    assert d.observed_peak_ratio < 1.25
+
+
+def test_drift_detector_does_not_flag_stationary_noise():
+    at = _make_autotuner(
+        drift_ewma_alpha=0.5,
+        drift_cusum_threshold=0.6,
+        drift_cusum_slack=0.05,
+    )
+    flags = [
+        at.observe(
+            step_time,
+            learner_id="rank-stable",
+            peer_baseline_ms=100.0,
+        ).drift_flag
+        for step_time in [99.0, 101.0, 98.0, 102.0, 100.0, 101.0, 99.0]
+    ]
+    assert flags == [False] * len(flags)
+
+
+def test_sustained_gate_suppresses_one_window_blip():
+    at = _make_autotuner(
+        base_grace_window_ms=1000,
+        window_steps=3,
+        min_samples=3,
+        sustained_windows=2,
+    )
+    for _ in range(3):
+        at.observe(100.0)
+
+    d_blip = at.observe(400.0)
+    assert d_blip.observed_peak_ratio == pytest.approx(4.0)
+    assert d_blip.effective_grace_window_ms == 1000
+    assert d_blip.sustained_grace_windows == 1
+
+    d_clean = at.observe(100.0)
+    assert d_clean.effective_grace_window_ms == 1000
+    assert d_clean.sustained_grace_windows == 0
+
+
+def test_sustained_gate_applies_after_k_windows():
+    at = _make_autotuner(
+        base_grace_window_ms=1000,
+        window_steps=3,
+        min_samples=3,
+        sustained_windows=2,
+    )
+    for _ in range(3):
+        at.observe(100.0)
+
+    first = at.observe(400.0)
+    second = at.observe(400.0)
+    assert first.effective_grace_window_ms == 1000
+    assert second.effective_grace_window_ms > 1000
+
+
 def test_threshold_clamped_to_max():
     at = _make_autotuner(base_zscore_threshold=3.0, cov_gain=100.0, zscore_max=8.0)
     d = None
@@ -184,6 +257,14 @@ def test_control_law_validation():
         _make_autotuner(cov_gain=-1.0)
     with pytest.raises(ValueError, match="grace_gain"):
         _make_autotuner(grace_gain=-1.0)
+    with pytest.raises(ValueError, match="sustained_windows"):
+        _make_autotuner(sustained_windows=0)
+    with pytest.raises(ValueError, match="drift_ewma_alpha"):
+        _make_autotuner(drift_ewma_alpha=0.0)
+    with pytest.raises(ValueError, match="drift_cusum_threshold"):
+        _make_autotuner(drift_cusum_threshold=0.0)
+    with pytest.raises(ValueError, match="drift_cusum_slack"):
+        _make_autotuner(drift_cusum_slack=-0.1)
     with pytest.raises(ValueError, match="step_time_ms"):
         _make_autotuner().observe(-1.0)
 
@@ -304,6 +385,40 @@ def test_runtime_autotuner_adapts_and_flags_straggler(tmp_path):
     # has no excluded learners.
     init_event = next(e for e in events if e["event"] == "mend_init")
     assert init_event["auto_tune_runtime_active"] is True
+
+
+def test_runtime_autotuner_emits_observe_only_drift_diagnostic(tmp_path):
+    model = _ToyModel()
+    config = MendConfig(
+        quorum_min_learners=1,
+        grace_window_ms=500,
+        failslow_zscore_threshold=3.0,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        auto_tune_runtime=True,
+        auto_tune_runtime_min_samples=2,
+        auto_tune_drift_ewma_alpha=0.5,
+        auto_tune_drift_cusum_threshold=0.1,
+        auto_tune_drift_cusum_slack=0.0,
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        for step, step_time in enumerate([100.0, 100.0, 130.0, 150.0, 170.0]):
+            rt.step_begin(step)
+            rt.step_end(step, step_time_ms_override=step_time)
+    finally:
+        mend_shutdown(model)
+
+    diag_files = list((tmp_path / "diag").glob("max_sdk_pid*.jsonl"))
+    assert diag_files
+    events = [json.loads(line) for line in open(diag_files[0])]
+    drift_events = [e for e in events if e["event"] == "auto_tune_runtime_drift"]
+    assert drift_events
+    assert all(e["learner_id"] == "rack-0/rank-0" for e in drift_events)
+    assert not [e for e in events if e["event"] == "rank_excluded"]
 
 
 def test_runtime_autotuner_no_mitigation_wired():

@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Runtime autotuner observe-only v2 signals: EWMA/CUSUM drift diagnostics
+  and a configurable sustained-window gate for sensitivity and grace-window
+  moves. Defaults preserve existing behavior.
+
 ### Changed
 
 - `MendConfig` construction is now keyword-only. This is a public-API tightening

@@ -132,6 +132,10 @@ class _MaxRuntime:
                 grace_max_ms=config.auto_tune_grace_window_max_ms,
                 cov_gain=config.auto_tune_cov_gain,
                 grace_gain=config.auto_tune_grace_gain,
+                sustained_windows=config.auto_tune_runtime_sustained_windows,
+                drift_ewma_alpha=config.auto_tune_drift_ewma_alpha,
+                drift_cusum_threshold=config.auto_tune_drift_cusum_threshold,
+                drift_cusum_slack=config.auto_tune_drift_cusum_slack,
             )
 
     def start(self, model: nn.Module) -> None:
@@ -299,7 +303,7 @@ class _MaxRuntime:
         assert self._autotuner is not None
         prev_z = self._autotuner.effective_zscore_threshold
         prev_g = self._autotuner.effective_grace_window_ms
-        d = self._autotuner.observe(step_time_ms)
+        d = self._autotuner.observe(step_time_ms, learner_id=self.rank_id)
         # Apply the effective values. The detector reads its threshold live
         # in observe(); the syncer reads grace_window_ms live in tick() and
         # the orchestrator reads it when computing its deadline.
@@ -319,6 +323,21 @@ class _MaxRuntime:
                 effective_zscore_threshold=d.effective_zscore_threshold,
                 effective_grace_window_ms=d.effective_grace_window_ms,
                 window_size=d.window_size,
+                drift_flag=d.drift_flag,
+                drift_cusum=d.drift_cusum,
+                sustained_zscore_windows=d.sustained_zscore_windows,
+                sustained_grace_windows=d.sustained_grace_windows,
+            )
+        if d.drift_flag:
+            self.diagnostics.emit(
+                "auto_tune_runtime_drift",
+                step=step,
+                rank_id=self.rank_id,
+                learner_id=d.drift_learner_id,
+                step_time_ms=step_time_ms,
+                drift_ewma_ms=d.drift_ewma_ms,
+                peer_baseline_ms=d.drift_peer_baseline_ms,
+                drift_cusum=d.drift_cusum,
             )
 
     def effective_failslow_zscore_threshold(self) -> float:

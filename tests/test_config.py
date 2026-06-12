@@ -116,6 +116,10 @@ def test_auto_tune_runtime_defaults_off():
     assert c.auto_tune_grace_window_max_ms == 10_000
     assert c.auto_tune_cov_gain == 4.0
     assert c.auto_tune_grace_gain == 1.0
+    assert c.auto_tune_runtime_sustained_windows == 1
+    assert c.auto_tune_drift_ewma_alpha == 0.2
+    assert c.auto_tune_drift_cusum_threshold == 2.0
+    assert c.auto_tune_drift_cusum_slack == 0.05
 
 
 def test_auto_tune_runtime_validation():
@@ -143,3 +147,11 @@ def test_auto_tune_runtime_validation():
         MendConfig(auto_tune_cov_gain=-1.0)
     with pytest.raises(ValueError, match="auto_tune_grace_gain"):
         MendConfig(auto_tune_grace_gain=-1.0)
+    with pytest.raises(ValueError, match="auto_tune_runtime_sustained_windows"):
+        MendConfig(auto_tune_runtime_sustained_windows=0)
+    with pytest.raises(ValueError, match="auto_tune_drift_ewma_alpha"):
+        MendConfig(auto_tune_drift_ewma_alpha=0.0)
+    with pytest.raises(ValueError, match="auto_tune_drift_cusum_threshold"):
+        MendConfig(auto_tune_drift_cusum_threshold=0.0)
+    with pytest.raises(ValueError, match="auto_tune_drift_cusum_slack"):
+        MendConfig(auto_tune_drift_cusum_slack=-0.1)

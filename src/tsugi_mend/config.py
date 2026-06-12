@@ -247,6 +247,16 @@ class MendConfig:
     # widens the grace window. Both must be >= 0.
     auto_tune_cov_gain: float = 4.0
     auto_tune_grace_gain: float = 1.0
+    # Number of consecutive windows a candidate sensitivity or grace-window
+    # move must persist before it is applied. Default 1 preserves the existing
+    # immediate adaptation behavior; larger values suppress one-window blips.
+    auto_tune_runtime_sustained_windows: int = 1
+    # Observe-only EWMA/CUSUM drift signal. The CUSUM accumulates positive
+    # EWMA latency excess relative to a peer baseline. It emits diagnostics
+    # only and never feeds exclusion, cadence, tensors, or merge selection.
+    auto_tune_drift_ewma_alpha: float = 0.2
+    auto_tune_drift_cusum_threshold: float = 2.0
+    auto_tune_drift_cusum_slack: float = 0.05
 
     # ------------------------------------------------------------------
     # Rack-aware topology
@@ -474,4 +484,24 @@ class MendConfig:
         if self.auto_tune_grace_gain < 0:
             raise ValueError(
                 f"auto_tune_grace_gain must be >= 0; got {self.auto_tune_grace_gain}"
+            )
+        if self.auto_tune_runtime_sustained_windows < 1:
+            raise ValueError(
+                f"auto_tune_runtime_sustained_windows must be >= 1; "
+                f"got {self.auto_tune_runtime_sustained_windows}"
+            )
+        if not (0.0 < self.auto_tune_drift_ewma_alpha <= 1.0):
+            raise ValueError(
+                f"auto_tune_drift_ewma_alpha must be in (0, 1]; "
+                f"got {self.auto_tune_drift_ewma_alpha}"
+            )
+        if self.auto_tune_drift_cusum_threshold <= 0:
+            raise ValueError(
+                f"auto_tune_drift_cusum_threshold must be > 0; "
+                f"got {self.auto_tune_drift_cusum_threshold}"
+            )
+        if self.auto_tune_drift_cusum_slack < 0:
+            raise ValueError(
+                f"auto_tune_drift_cusum_slack must be >= 0; "
+                f"got {self.auto_tune_drift_cusum_slack}"
             )

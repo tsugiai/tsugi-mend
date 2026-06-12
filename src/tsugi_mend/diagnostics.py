@@ -15,6 +15,8 @@ Standard event names emitted by the runtime:
     "mend_shutdown"       runtime stopped
     "outer_round"        a Decoupled DiLoCo outer round completed
     "failslow_decision"  per-rank fail-slow decision after a step
+    "auto_tune_runtime_decision" effective observe-only autotuner move
+    "auto_tune_runtime_drift"    observe-only EWMA/CUSUM drift flag
     "sideband_snapshot"  periodic peer-progress snapshot
 """
 from __future__ import annotations
