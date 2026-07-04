@@ -541,6 +541,134 @@ def _collect_with_deadline(rt, timeout_s: float = 3.0):
     return None
 
 
+def _read_diag_events(diag_dir):
+    diag_files = list(diag_dir.glob("max_sdk_pid*.jsonl"))
+    assert diag_files, "diagnostics file not written"
+    return [json.loads(line) for line in open(diag_files[0])]
+
+
+def test_eng29_default_runtime_keeps_v2_paths_off(tmp_path):
+    """Default config keeps runtime-autotuner and incremental collect off,
+    and does not emit v2 diagnostic events."""
+    model = ToyLoraStyleModel()
+    config = MendConfig(diagnostics_dir=str(tmp_path / "diag"))
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        assert rt._autotuner is None
+        assert rt.syncer.incremental_collect is False
+        assert rt.syncer.last_merge_used_incremental is None
+        assert rt.effective_failslow_zscore_threshold() == config.failslow_zscore_threshold
+        assert rt.effective_grace_window_ms() == config.grace_window_ms
+        for step in range(12):
+            rt.step_end(step, step_time_ms_override=100.0)
+    finally:
+        mend_shutdown(model)
+
+    events = _read_diag_events(tmp_path / "diag")
+    assert "auto_tune_drift_flag" not in {e["event"] for e in events}
+    assert "auto_tune_runtime_decision" not in {e["event"] for e in events}
+
+
+def test_eng29_runtime_threads_autotuner_v2_knobs(tmp_path):
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=1,
+        grace_window_ms=100,
+        auto_tune_runtime=True,
+        auto_tune_runtime_window_steps=7,
+        auto_tune_runtime_min_samples=3,
+        auto_tune_sustain_windows=4,
+        auto_tune_drift_ewma_alpha=0.35,
+        auto_tune_drift_baseline_alpha=0.05,
+        auto_tune_drift_cusum_slack=0.25,
+        auto_tune_drift_cusum_threshold=3.5,
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    try:
+        rt = get_runtime(model)
+        assert rt._autotuner is not None
+        autotuner = rt._autotuner
+        assert autotuner.sustain_windows == 4
+        assert autotuner.window_steps == 7
+        assert autotuner.min_samples == 3
+        assert autotuner._drift.ewma_alpha == 0.35
+        assert autotuner._drift.baseline_alpha == 0.05
+        assert autotuner._drift.cusum_slack == 0.25
+        assert autotuner._drift.cusum_threshold == 3.5
+    finally:
+        mend_shutdown(model)
+
+
+def test_eng29_runtime_emits_drift_flag_rising_edge(tmp_path):
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=1,
+        grace_window_ms=0,
+        auto_tune_runtime=True,
+        auto_tune_runtime_window_steps=20,
+        auto_tune_runtime_min_samples=5,
+        auto_tune_drift_ewma_alpha=0.2,
+        auto_tune_drift_baseline_alpha=0.02,
+        auto_tune_drift_cusum_slack=1.0,
+        auto_tune_drift_cusum_threshold=8.0,
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    try:
+        rt = get_runtime(model)
+        drift_stream = [100.0] * 10 + [100.0 + 2.0 * i for i in range(200)]
+        for step, step_time_ms in enumerate(drift_stream):
+            rt.step_end(step, step_time_ms_override=step_time_ms)
+    finally:
+        mend_shutdown(model)
+
+    events = _read_diag_events(tmp_path / "diag")
+    flag_events = [e for e in events if e["event"] == "auto_tune_drift_flag"]
+    assert len(flag_events) == 1
+    event = flag_events[0]
+    assert event["learner_id"] == "local"
+    assert event["observation_index"] > config.auto_tune_runtime_min_samples
+    assert event["cusum"] > event["cusum_threshold"]
+    assert event["cusum_threshold"] == config.auto_tune_drift_cusum_threshold
+    assert event["ewma_ms"] > event["baseline_ms"]
+
+
+def test_eng29_runtime_threads_incremental_collect(tmp_path):
+    model = ToyLoraStyleModel()
+    config = MendConfig(
+        quorum_min_learners=2,
+        grace_window_ms=30,
+        sync_period_steps=4,
+        momentum_sync_period_steps=8,
+        concurrent_outer_step=True,
+        incremental_collect=True,
+        sideband_peers=(),
+        diagnostics_dir=str(tmp_path / "diag"),
+    )
+    mend_init(model, config, rank_id="rack-0/rank-0")
+    rt = get_runtime(model)
+    try:
+        frags = [
+            _build_fragment("rack-0", round_id=29, value=1.0),
+            _build_fragment("rack-1", round_id=29, value=3.0),
+        ]
+        rt.outer_step_begin(
+            round_id=29,
+            fragment_provider=_multi_learner_provider_factory(frags),
+        )
+        result = _collect_with_deadline(rt, timeout_s=3.0)
+        assert result is not None, "outer-step did not complete within 3s"
+        assert torch.allclose(result.merged_delta[0], torch.tensor([2.0]))
+        assert rt.syncer.incremental_collect is True
+        assert rt.syncer.last_merge_used_incremental is True
+    finally:
+        mend_shutdown(model)
+
+
 def test_eng5_early_finalize_fires_all_present_via_runtime(tmp_path):
     """(a) With the operator-declared roster wired through MendConfig, the
     real runtime path early-finalizes (reason == 'all_present') the moment
