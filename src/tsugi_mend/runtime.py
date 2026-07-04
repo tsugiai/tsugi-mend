@@ -67,6 +67,7 @@ class _MaxRuntime:
             token_weighted=config.token_weighted_merge,
             simulated_merge_delay_ms=config.simulated_merge_delay_ms,
             simulated_merge_delay_distribution=config.simulated_merge_delay_distribution,
+            incremental_collect=config.incremental_collect,
         )
         self.sideband: Optional[Sideband] = None
         if config.sideband_peers:
@@ -132,6 +133,12 @@ class _MaxRuntime:
                 grace_max_ms=config.auto_tune_grace_window_max_ms,
                 cov_gain=config.auto_tune_cov_gain,
                 grace_gain=config.auto_tune_grace_gain,
+                sustain_windows=config.auto_tune_sustain_windows,
+                drift_ewma_alpha=config.auto_tune_drift_ewma_alpha,
+                drift_baseline_alpha=config.auto_tune_drift_baseline_alpha,
+                drift_cusum_slack=config.auto_tune_drift_cusum_slack,
+                drift_cusum_threshold=config.auto_tune_drift_cusum_threshold,
+                diagnostics=self.diagnostics,
             )
 
     def start(self, model: nn.Module) -> None:

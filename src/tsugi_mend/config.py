@@ -76,10 +76,9 @@ class MendConfig:
     # back to the frozen finalize-time merge for any round where
     # order-identity cannot be proven (e.g. a resubmitted fragment).
     # Default False preserves the historical collect-then-merge path
-    # byte-for-byte. NOTE (0.1.x): consumed by GraceWindowSyncer's
-    # constructor when the syncer is built directly; threading this knob
-    # through the runtime / ConcurrentOuterStep wiring is a separate
-    # follow-up change.
+    # byte-for-byte. The runtime threads this to GraceWindowSyncer, so
+    # ConcurrentOuterStep uses the same default-off behavior unless the
+    # operator explicitly enables it.
     incremental_collect: bool = False
     # Operator-declared expected learner (rack) roster for each outer
     # round. When set, the runtime threads it to
